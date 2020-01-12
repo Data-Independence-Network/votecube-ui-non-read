@@ -2,15 +2,20 @@ package main
 
 import (
 	"bitbucket.org/votecube/votecube-ui-non-read/sequence"
+	"bytes"
 	"database/sql"
+	"encoding/binary"
 	"flag"
+	"fmt"
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fasthttp/router"
 	"github.com/gocql/gocql"
+	"github.com/klauspost/compress/gzip"
 	_ "github.com/lib/pq"
 	"github.com/robfig/cron"
 	"github.com/scylladb/gocqlx"
@@ -27,6 +32,7 @@ var (
 	session                 *gocql.Session
 	err                     error
 	dateStamp               = GetDateStamp()
+	codeCreated             = 201
 	codeBadRequest          = 400
 	codeInternalServerError = 500
 	insertOpinion           *gocqlx.Queryx
@@ -34,6 +40,9 @@ var (
 	insertPollKey           *gocqlx.Queryx
 	insertThread            *gocqlx.Queryx
 	batchId                 = -1
+	gzippers                = sync.Pool{New: func() interface{} {
+		return gzip.NewWriter(nil)
+	}}
 	//compress = flag.Bool("compress", false, "Whether to enable transparent response compression")
 )
 
@@ -80,6 +89,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	opinionIdCursor, err := sequence.OpinionId.GetCursor(1)
 	if err != nil {
 		log.Printf("AddOpinion: Unable to access OPINION_ID sequence")
+		log.Print(err)
 		ctx.Response.SetStatusCode(codeInternalServerError)
 		return
 	}
@@ -87,14 +97,31 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	now := time.Now()
 	createEs := now.Unix()
 
+	opinionId := opinionIdCursor.Next()
+
+	var buf bytes.Buffer
+	// https://blog.klauspost.com/gzip-performance-for-go-webservers/
+	gz := gzippers.Get().(*gzip.Writer)
+	gz.Reset(&buf)
+
+	defer gzippers.Put(gz)
+	defer gz.Close()
+
+	if _, err := gz.Write(requestBytes); err != nil {
+		log.Printf("Unable to gzip opinion")
+		log.Print(err)
+		ctx.Response.SetStatusCode(codeInternalServerError)
+		return
+	}
+
 	opinion := Opinion{
-		OpinionId: opinionIdCursor.Next(),
+		OpinionId: opinionId,
 		PollId:    pollId,
 		Date:      dateStamp,
 		UserId:    1,
 		//CreateDt: time.Now(),
 		CreateEs:  createEs,
-		Data:      requestBytes,
+		Data:      buf.Bytes(),
 		Processed: false,
 	}
 
@@ -106,6 +133,8 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		ctx.Response.SetStatusCode(codeInternalServerError)
 		return
 	}
+
+	encodeIdAndCreateEs(opinionId, createEs, ctx.Response)
 }
 
 func AddPoll(ctx *fasthttp.RequestCtx) {
@@ -123,11 +152,26 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	now := time.Now()
 	createEs := now.Unix()
 
+	var buf bytes.Buffer
+	// https://blog.klauspost.com/gzip-performance-for-go-webservers/
+	gz := gzippers.Get().(*gzip.Writer)
+	gz.Reset(&buf)
+
+	defer gzippers.Put(gz)
+	defer gz.Close()
+
+	if _, err := gz.Write(requestBytes); err != nil {
+		log.Printf("Unable to gzip poll")
+		log.Print(err)
+		ctx.Response.SetStatusCode(codeInternalServerError)
+		return
+	}
+
 	poll := Poll{
 		PollId:   pollId,
 		UserId:   1,
 		CreateEs: createEs,
-		Data:     requestBytes,
+		Data:     buf.Bytes(),
 	}
 
 	batchId = (batchId + 1) % 128
@@ -169,6 +213,71 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		ctx.Response.SetStatusCode(codeInternalServerError)
 		return
 	}
+
+	encodeIdAndCreateEs(pollId, createEs, ctx.Response)
+}
+
+func encodeIdAndCreateEs(id uint64, createEs int64, response fasthttp.Response) {
+	idBuffer := new(bytes.Buffer)
+	err := binary.Write(idBuffer, binary.LittleEndian, id)
+	if err != nil {
+		fmt.Println("binary.Write failed:", err)
+		response.SetStatusCode(codeInternalServerError)
+		return
+	}
+	idBytes := idBuffer.Bytes()
+
+	var idSignificantBytes []byte
+	var byteMask uint8
+
+	if id < 256 {
+		idSignificantBytes = idBytes[0:1]
+		byteMask = 0
+	} else if id < 65536 {
+		idSignificantBytes = idBytes[0:2]
+		byteMask = 1
+	} else if id < 16777216 {
+		idSignificantBytes = idBytes[0:3]
+		byteMask = 2
+	} else if id < 4294967296 {
+		idSignificantBytes = idBytes[0:4]
+		byteMask = 3
+	} else if id < 1099511627776 {
+		idSignificantBytes = idBytes[0:5]
+		byteMask = 4
+	} else if id < 281474976710656 {
+		idSignificantBytes = idBytes[0:6]
+		byteMask = 5
+	} else if id < 72057594037927936 {
+		idSignificantBytes = idBytes[0:7]
+		byteMask = 6
+	} else {
+		idSignificantBytes = idBytes
+		byteMask = 7
+	}
+
+	createEsBuffer := new(bytes.Buffer)
+	err = binary.Write(createEsBuffer, binary.LittleEndian, id)
+	if err != nil {
+		fmt.Println("binary.Write failed:", err)
+		response.SetStatusCode(codeInternalServerError)
+		return
+	}
+	createEsBytes := createEsBuffer.Bytes()
+
+	var createEsSignificantBytes []byte
+
+	if createEs < 4294967296 {
+		createEsSignificantBytes = createEsBytes[0:4]
+	} else {
+		createEsSignificantBytes = createEsBytes[0:5]
+		byteMask += 8
+	}
+
+	response.SetStatusCode(codeCreated)
+	response.AppendBody([]byte{byteMask})
+	response.AppendBody(idSignificantBytes)
+	response.AppendBody(createEsSignificantBytes)
 }
 
 func GetDateStamp() string {
@@ -231,8 +340,8 @@ func main() {
 	insertThread = gocqlx.Query(session.Query(stmt), names)
 
 	r := router.New()
-	r.GET("/put/add/opinion/:pollId", AddOpinion)
-	r.GET("/put/add/poll", AddPoll)
+	r.PUT("/put/opinion/:pollId", AddOpinion)
+	r.PUT("/put/poll", AddPoll)
 
 	log.Fatal(fasthttp.ListenAndServe(*addr, r.Handler))
 }
