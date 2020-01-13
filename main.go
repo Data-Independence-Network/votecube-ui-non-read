@@ -6,8 +6,8 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"flag"
-	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,14 +83,15 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	pollId, parseError := strconv.ParseUint(ctx.UserValue("pollId").(string), 0, 64)
 	if parseError != nil {
 		log.Printf("AddOpinion: Invalid pollId: %s", ctx.UserValue("pollId"))
-		ctx.Response.SetStatusCode(codeBadRequest)
+		log.Print(parseError)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 	opinionIdCursor, err := sequence.OpinionId.GetCursor(1)
 	if err != nil {
-		log.Printf("AddOpinion: Unable to access OPINION_ID sequence")
+		log.Print("AddOpinion: Unable to access OPINION_ID sequence")
 		log.Print(err)
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 
@@ -105,14 +106,15 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	gz.Reset(&buf)
 
 	defer gzippers.Put(gz)
-	defer gz.Close()
 
 	if _, err := gz.Write(requestBytes); err != nil {
-		log.Printf("Unable to gzip opinion")
+		log.Print("Unable to gzip opinion")
 		log.Print(err)
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		gz.Close()
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
+	gz.Close()
 
 	opinion := Opinion{
 		OpinionId: opinionId,
@@ -128,13 +130,13 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	insert := insertOpinion.BindStruct(opinion)
 
 	if err := insert.Exec(); err != nil {
-		log.Printf("AddOpinion: Insert error")
+		log.Print("AddOpinion: Insert error")
 		log.Print(err)
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 
-	encodeIdAndCreateEs(opinionId, createEs, ctx.Response)
+	encodeIdAndCreateEs(opinionId, createEs, ctx)
 }
 
 func AddPoll(ctx *fasthttp.RequestCtx) {
@@ -142,8 +144,9 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 
 	pollIdCursor, err := sequence.PollId.GetCursor(1)
 	if err != nil {
-		log.Printf("AddPoll: Unable to access POLL_ID sequence")
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		log.Print("AddPoll: Unable to access POLL_ID sequence")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 
@@ -158,14 +161,15 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	gz.Reset(&buf)
 
 	defer gzippers.Put(gz)
-	defer gz.Close()
 
 	if _, err := gz.Write(requestBytes); err != nil {
-		log.Printf("Unable to gzip poll")
+		log.Print("Unable to gzip poll")
 		log.Print(err)
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		gz.Close()
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
+	gz.Close()
 
 	poll := Poll{
 		PollId:   pollId,
@@ -192,37 +196,38 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 
 	insert := insertPoll.BindStruct(poll)
 	if err := insert.Exec(); err != nil {
-		log.Printf("AddPoll: Insert POLLS error")
+		log.Print("AddPoll: Insert POLLS error")
 		log.Print(err)
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 
 	insert = insertPollKey.BindStruct(pollKey)
 	if err := insert.Exec(); err != nil {
-		log.Printf("AddPoll: Insert POLL_KEYS error")
+		log.Print("AddPoll: Insert POLL_KEYS error")
 		log.Print(err)
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		ctx.Error("Error adding Poll", http.StatusInternalServerError)
 		return
 	}
 
 	insert = insertThread.BindStruct(thread)
 	if err := insert.Exec(); err != nil {
-		log.Printf("AddPoll: Insert THREADS error")
+		log.Print("AddPoll: Insert THREADS error")
 		log.Print(err)
-		ctx.Response.SetStatusCode(codeInternalServerError)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 
-	encodeIdAndCreateEs(pollId, createEs, ctx.Response)
+	encodeIdAndCreateEs(pollId, createEs, ctx)
 }
 
-func encodeIdAndCreateEs(id uint64, createEs int64, response fasthttp.Response) {
+func encodeIdAndCreateEs(id uint64, createEs int64, ctx *fasthttp.RequestCtx) {
 	idBuffer := new(bytes.Buffer)
 	err := binary.Write(idBuffer, binary.LittleEndian, id)
 	if err != nil {
-		fmt.Println("binary.Write failed:", err)
-		response.SetStatusCode(codeInternalServerError)
+		log.Print("binary.Write failed:")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 	idBytes := idBuffer.Bytes()
@@ -257,10 +262,11 @@ func encodeIdAndCreateEs(id uint64, createEs int64, response fasthttp.Response) 
 	}
 
 	createEsBuffer := new(bytes.Buffer)
-	err = binary.Write(createEsBuffer, binary.LittleEndian, id)
+	err = binary.Write(createEsBuffer, binary.LittleEndian, createEs)
 	if err != nil {
-		fmt.Println("binary.Write failed:", err)
-		response.SetStatusCode(codeInternalServerError)
+		log.Print("binary.Write failed")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
 	createEsBytes := createEsBuffer.Bytes()
@@ -274,10 +280,27 @@ func encodeIdAndCreateEs(id uint64, createEs int64, response fasthttp.Response) 
 		byteMask += 8
 	}
 
-	response.SetStatusCode(codeCreated)
-	response.AppendBody([]byte{byteMask})
-	response.AppendBody(idSignificantBytes)
-	response.AppendBody(createEsSignificantBytes)
+	/*
+		fmt.Println("")
+		fmt.Println("id:       %d", id)
+		fmt.Println("createEs: %d", createEs)
+		fmt.Printf("%d ", byteMask)
+		for _, n := range idSignificantBytes {
+			fmt.Printf("%d ", n)
+		}
+		for _, n := range createEsSignificantBytes {
+			fmt.Printf("%d ", n)
+		}
+		fmt.Println("")
+	*/
+
+	// https://github.com/valyala/fasthttp/issues/444
+	ctx.Response.Reset()
+	ctx.SetStatusCode(codeCreated)
+	ctx.SetContentType("vcb")
+	ctx.Response.AppendBody([]byte{byteMask})
+	ctx.Response.AppendBody(idSignificantBytes)
+	ctx.Response.AppendBody(createEsSignificantBytes)
 }
 
 func GetDateStamp() string {
@@ -333,7 +356,7 @@ func main() {
 	stmt, names = qb.Insert("polls").Columns("poll_id", "user_id", "create_es", "data").ToCql()
 	insertPoll = gocqlx.Query(session.Query(stmt), names)
 
-	stmt, names = qb.Insert("polls").Columns("poll_id", "user_id", "create_es", "batch_id").ToCql()
+	stmt, names = qb.Insert("poll_keys").Columns("poll_id", "user_id", "create_es", "batch_id").ToCql()
 	insertPollKey = gocqlx.Query(session.Query(stmt), names)
 
 	stmt, names = qb.Insert("threads").Columns("poll_id", "user_id", "create_es", "data").ToCql()

@@ -109,6 +109,7 @@ func (seq *Sequence) GetCursor(numVals int) (SequenceCursor, error) {
 
 	return SequenceCursor{
 		blocks:            blocks,
+		currentBlock:      &blocks[0],
 		currentBlockIndex: 0,
 		currentId:         blocks[0].Start - 1,
 	}, nil
