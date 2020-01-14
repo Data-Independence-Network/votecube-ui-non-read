@@ -24,23 +24,19 @@ import (
 )
 
 var (
-	DB                      *sql.DB
-	scdbHosts               = flag.String("scdbHosts", "localhost", "TCP address to listen to")
-	crdbPath                = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
-	addr                    = flag.String("addr", ":8445", "TCP address to listen to")
-	cluster                 *gocql.ClusterConfig
-	session                 *gocql.Session
-	err                     error
-	dateStamp               = GetDateStamp()
-	codeCreated             = 201
-	codeBadRequest          = 400
-	codeInternalServerError = 500
-	insertOpinion           *gocqlx.Queryx
-	insertPoll              *gocqlx.Queryx
-	insertPollKey           *gocqlx.Queryx
-	insertThread            *gocqlx.Queryx
-	batchId                 = -1
-	gzippers                = sync.Pool{New: func() interface{} {
+	DB            *sql.DB
+	scdbHosts     = flag.String("scdbHosts", "localhost", "TCP address to listen to")
+	crdbPath      = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
+	addr          = flag.String("addr", ":8445", "TCP address to listen to")
+	cluster       *gocql.ClusterConfig
+	session       *gocql.Session
+	err           error
+	dateStamp     = GetDateStamp()
+	insertOpinion *gocqlx.Queryx
+	insertPoll    *gocqlx.Queryx
+	insertThread  *gocqlx.Queryx
+	batchId       = -1
+	gzippers      = sync.Pool{New: func() interface{} {
 		return gzip.NewWriter(nil)
 	}}
 	//compress = flag.Bool("compress", false, "Whether to enable transparent response compression")
@@ -58,17 +54,14 @@ type Opinion struct {
 }
 
 type Poll struct {
-	PollId   uint64
-	UserId   uint64
-	CreateEs int64
-	Data     []byte
-}
-
-type PollKey struct {
-	PollId   uint64
-	UserId   uint64
-	CreateEs int64
-	BatchId  int
+	PollId     uint64
+	LocationId uint64
+	ThemeId    uint64
+	UserId     uint64
+	Date       string
+	CreateEs   int64
+	Data       []byte
+	BatchId    int
 }
 
 type Thread struct {
@@ -171,20 +164,17 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	}
 	gz.Close()
 
-	poll := Poll{
-		PollId:   pollId,
-		UserId:   1,
-		CreateEs: createEs,
-		Data:     buf.Bytes(),
-	}
-
 	batchId = (batchId + 1) % 128
 
-	pollKey := PollKey{
-		PollId:   pollId,
-		UserId:   1,
-		CreateEs: createEs,
-		BatchId:  batchId,
+	poll := Poll{
+		PollId:     pollId,
+		LocationId: 1,
+		ThemeId:    1,
+		UserId:     1,
+		Date:       dateStamp,
+		CreateEs:   createEs,
+		Data:       buf.Bytes(),
+		BatchId:    batchId,
 	}
 
 	thread := Thread{
@@ -199,14 +189,6 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		log.Print("AddPoll: Insert POLLS error")
 		log.Print(err)
 		ctx.Error("Error adding Record", http.StatusInternalServerError)
-		return
-	}
-
-	insert = insertPollKey.BindStruct(pollKey)
-	if err := insert.Exec(); err != nil {
-		log.Print("AddPoll: Insert POLL_KEYS error")
-		log.Print(err)
-		ctx.Error("Error adding Poll", http.StatusInternalServerError)
 		return
 	}
 
@@ -296,7 +278,7 @@ func encodeIdAndCreateEs(id uint64, createEs int64, ctx *fasthttp.RequestCtx) {
 
 	// https://github.com/valyala/fasthttp/issues/444
 	ctx.Response.Reset()
-	ctx.SetStatusCode(codeCreated)
+	ctx.SetStatusCode(http.StatusCreated)
 	ctx.SetContentType("vcb")
 	ctx.Response.AppendBody([]byte{byteMask})
 	ctx.Response.AppendBody(idSignificantBytes)
@@ -353,11 +335,8 @@ func main() {
 	stmt, names := qb.Insert("opinions").Columns("opinion_id", "poll_id", "date", "user_id", "create_es", "data").ToCql()
 	insertOpinion = gocqlx.Query(session.Query(stmt), names)
 
-	stmt, names = qb.Insert("polls").Columns("poll_id", "user_id", "create_es", "data").ToCql()
+	stmt, names = qb.Insert("polls").Columns("poll_id", "location_id", "theme_id", "user_id", "date", "create_es", "data", "batch_id").ToCql()
 	insertPoll = gocqlx.Query(session.Query(stmt), names)
-
-	stmt, names = qb.Insert("poll_keys").Columns("poll_id", "user_id", "create_es", "batch_id").ToCql()
-	insertPollKey = gocqlx.Query(session.Query(stmt), names)
 
 	stmt, names = qb.Insert("threads").Columns("poll_id", "user_id", "create_es", "data").ToCql()
 	insertThread = gocqlx.Query(session.Query(stmt), names)
