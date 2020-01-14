@@ -55,8 +55,8 @@ type Opinion struct {
 
 type Poll struct {
 	PollId     uint64
-	LocationId uint64
 	ThemeId    uint64
+	LocationId uint32
 	UserId     uint64
 	Date       string
 	CreateEs   int64
@@ -168,8 +168,8 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 
 	poll := Poll{
 		PollId:     pollId,
-		LocationId: 1,
 		ThemeId:    1,
+		LocationId: 1,
 		UserId:     1,
 		Date:       dateStamp,
 		CreateEs:   createEs,
@@ -286,7 +286,7 @@ func encodeIdAndCreateEs(id uint64, createEs int64, ctx *fasthttp.RequestCtx) {
 }
 
 func GetDateStamp() string {
-	return time.Now().Format("2006-01-02")
+	return time.Now().Format("20060102")
 }
 
 func Daily() {
@@ -335,7 +335,7 @@ func main() {
 	stmt, names := qb.Insert("opinions").Columns("opinion_id", "poll_id", "date", "user_id", "create_es", "data").ToCql()
 	insertOpinion = gocqlx.Query(session.Query(stmt), names)
 
-	stmt, names = qb.Insert("polls").Columns("poll_id", "location_id", "theme_id", "user_id", "date", "create_es", "data", "batch_id").ToCql()
+	stmt, names = qb.Insert("polls").Columns("poll_id", "theme_id", "location_id", "user_id", "date", "create_es", "data", "batch_id").ToCql()
 	insertPoll = gocqlx.Query(session.Query(stmt), names)
 
 	stmt, names = qb.Insert("threads").Columns("poll_id", "user_id", "create_es", "data").ToCql()
