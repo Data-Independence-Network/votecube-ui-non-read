@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
@@ -62,6 +63,13 @@ type Poll struct {
 	CreateEs   int64
 	Data       []byte
 	BatchId    int
+}
+
+type PollData struct {
+	Id       uint64 `json:"id"`
+	CreateEs int64  `json:"createEs"`
+	Title    string `json:"title"`
+	Contents string `json:"contents"` // `json:"contents,omitempty"`
 }
 
 type Thread struct {
@@ -145,8 +153,28 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 
 	pollId := pollIdCursor.Next()
 
+	pollData := PollData{}
+	if err := json.Unmarshal(requestBytes, &pollData); err != nil {
+		log.Print("Unable to unmarshal poll")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
+		return
+	}
+
 	now := time.Now()
 	createEs := now.Unix()
+
+	pollData.Id = pollId
+	pollData.CreateEs = createEs
+
+	pollBytes, err := json.Marshal(pollData)
+
+	if err != nil {
+		log.Print("Unable to marshal poll")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
+		return
+	}
 
 	var buf bytes.Buffer
 	// https://blog.klauspost.com/gzip-performance-for-go-webservers/
@@ -155,7 +183,7 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 
 	defer gzippers.Put(gz)
 
-	if _, err := gz.Write(requestBytes); err != nil {
+	if _, err := gz.Write(pollBytes); err != nil {
 		log.Print("Unable to gzip poll")
 		log.Print(err)
 		gz.Close()
