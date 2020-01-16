@@ -54,6 +54,13 @@ type Opinion struct {
 	Processed bool
 }
 
+type OpinionData struct {
+	Id       uint64 `json:"id"`
+	PollId   uint64 `json:"pollId"`
+	CreateEs int64  `json:"createEs"`
+	Text     string `json:"text"`
+}
+
 type Poll struct {
 	PollId     uint64
 	ThemeId    uint64
@@ -80,7 +87,6 @@ type Thread struct {
 }
 
 func AddOpinion(ctx *fasthttp.RequestCtx) {
-	requestBytes := (*ctx).Request.Body()
 	pollId, parseError := strconv.ParseUint(ctx.UserValue("pollId").(string), 0, 64)
 	if parseError != nil {
 		log.Printf("AddOpinion: Invalid pollId: %s", ctx.UserValue("pollId"))
@@ -88,6 +94,16 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
+
+	requestBytes := (*ctx).Request.Body()
+	opinionData := OpinionData{}
+	if err := json.Unmarshal(requestBytes, &opinionData); err != nil {
+		log.Print("Unable to unmarshal opinion")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
+		return
+	}
+
 	opinionIdCursor, err := sequence.OpinionId.GetCursor(1)
 	if err != nil {
 		log.Print("AddOpinion: Unable to access OPINION_ID sequence")
@@ -95,11 +111,22 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		ctx.Error("Error adding Record", http.StatusInternalServerError)
 		return
 	}
+	opinionId := opinionIdCursor.Next()
 
 	now := time.Now()
 	createEs := now.Unix()
 
-	opinionId := opinionIdCursor.Next()
+	opinionData.Id = opinionId
+	opinionData.PollId = pollId
+	opinionData.CreateEs = createEs
+
+	opinionBytes, err := json.Marshal(opinionData)
+	if err != nil {
+		log.Print("Unable to marshal opinion")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
+		return
+	}
 
 	var buf bytes.Buffer
 	// https://blog.klauspost.com/gzip-performance-for-go-webservers/
@@ -108,7 +135,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 
 	defer gzippers.Put(gz)
 
-	if _, err := gz.Write(requestBytes); err != nil {
+	if _, err := gz.Write(opinionBytes); err != nil {
 		log.Print("Unable to gzip opinion")
 		log.Print(err)
 		gz.Close()
@@ -143,16 +170,6 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 func AddPoll(ctx *fasthttp.RequestCtx) {
 	requestBytes := (*ctx).Request.Body()
 
-	pollIdCursor, err := sequence.PollId.GetCursor(1)
-	if err != nil {
-		log.Print("AddPoll: Unable to access POLL_ID sequence")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
-		return
-	}
-
-	pollId := pollIdCursor.Next()
-
 	pollData := PollData{}
 	if err := json.Unmarshal(requestBytes, &pollData); err != nil {
 		log.Print("Unable to unmarshal poll")
@@ -161,6 +178,15 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	pollIdCursor, err := sequence.PollId.GetCursor(1)
+	if err != nil {
+		log.Print("AddPoll: Unable to access POLL_ID sequence")
+		log.Print(err)
+		ctx.Error("Error adding Record", http.StatusInternalServerError)
+		return
+	}
+	pollId := pollIdCursor.Next()
+
 	now := time.Now()
 	createEs := now.Unix()
 
@@ -168,7 +194,6 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	pollData.CreateEs = createEs
 
 	pollBytes, err := json.Marshal(pollData)
-
 	if err != nil {
 		log.Print("Unable to marshal poll")
 		log.Print(err)
