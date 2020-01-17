@@ -25,33 +25,45 @@ import (
 )
 
 var (
-	DB            *sql.DB
-	scdbHosts     = flag.String("scdbHosts", "localhost", "TCP address to listen to")
-	crdbPath      = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
-	addr          = flag.String("addr", ":8445", "TCP address to listen to")
-	cluster       *gocql.ClusterConfig
-	session       *gocql.Session
-	err           error
-	dateStamp     = GetDateStamp()
-	insertOpinion *gocqlx.Queryx
-	insertPoll    *gocqlx.Queryx
-	insertThread  *gocqlx.Queryx
-	batchId       = -1
-	gzippers      = sync.Pool{New: func() interface{} {
+	DB                  *sql.DB
+	scdbHosts           = flag.String("scdbHosts", "localhost", "TCP address to listen to")
+	crdbPath            = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
+	addr                = flag.String("addr", ":8445", "TCP address to listen to")
+	cluster             *gocql.ClusterConfig
+	session             *gocql.Session
+	err                 error
+	dateStamp           = getDateStamp()
+	insertOpinion       *gocqlx.Queryx
+	insertPoll          *gocqlx.Queryx
+	insertThread        *gocqlx.Queryx
+	insertOpinionUpdate *gocqlx.Queryx
+	batchId             = -1
+	gzippers            = sync.Pool{New: func() interface{} {
 		return gzip.NewWriter(nil)
 	}}
 	//compress = flag.Bool("compress", false, "Whether to enable transparent response compression")
 )
 
 type Opinion struct {
-	OpinionId uint64
-	PollId    uint64
-	Date      string
-	UserId    uint64
-	//CreateDt time.Time
-	CreateEs  int64
-	Data      []byte
-	Processed bool
+	OpinionId       uint64
+	PollId          uint64
+	CreateDate      string
+	UserId          uint64
+	CreateEs        int64
+	UpdateEs        int64
+	Version         int32
+	Data            []byte
+	InsertProcessed bool
+}
+
+type OpinionUpdate struct {
+	OpinionId       uint64
+	PollId          uint64
+	UpdateDate      string
+	UserId          uint64
+	UpdateEs        int64
+	Data            []byte
+	UpdateProcessed bool
 }
 
 type OpinionData struct {
@@ -87,135 +99,97 @@ type Thread struct {
 }
 
 func AddOpinion(ctx *fasthttp.RequestCtx) {
-	pollId, parseError := strconv.ParseUint(ctx.UserValue("pollId").(string), 0, 64)
-	if parseError != nil {
-		log.Printf("AddOpinion: Invalid pollId: %s", ctx.UserValue("pollId"))
-		log.Print(parseError)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	ctx.SetUserValue("recordType", "opinion")
+
+	pollId, ok := parseIntParam("pollId", ctx)
+	if !ok {
 		return
 	}
-
 	requestBytes := (*ctx).Request.Body()
 	opinionData := OpinionData{}
-	if err := json.Unmarshal(requestBytes, &opinionData); err != nil {
-		log.Print("Unable to unmarshal opinion")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	if !unmarshal(requestBytes, &opinionData, ctx) {
 		return
 	}
-
-	opinionIdCursor, err := sequence.OpinionId.GetCursor(1)
-	if err != nil {
-		log.Print("AddOpinion: Unable to access OPINION_ID sequence")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	opinionId, ok := getSeq(sequence.OpinionId, ctx)
+	if !ok {
 		return
 	}
-	opinionId := opinionIdCursor.Next()
-
-	now := time.Now()
-	createEs := now.Unix()
 
 	opinionData.Id = opinionId
 	opinionData.PollId = pollId
+	createEs := time.Now().Unix()
 	opinionData.CreateEs = createEs
 
-	opinionBytes, err := json.Marshal(opinionData)
-	if err != nil {
-		log.Print("Unable to marshal opinion")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	opinionBytes, ok := marshal(opinionData, ctx)
+	if !ok {
 		return
 	}
-
-	var buf bytes.Buffer
-	// https://blog.klauspost.com/gzip-performance-for-go-webservers/
-	gz := gzippers.Get().(*gzip.Writer)
-	gz.Reset(&buf)
-
-	defer gzippers.Put(gz)
-
-	if _, err := gz.Write(opinionBytes); err != nil {
-		log.Print("Unable to gzip opinion")
-		log.Print(err)
-		gz.Close()
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	compressedOpinion, ok := zip(opinionBytes, ctx)
+	if !ok {
 		return
 	}
-	gz.Close()
 
 	opinion := Opinion{
-		OpinionId: opinionId,
-		PollId:    pollId,
-		Date:      dateStamp,
-		UserId:    1,
-		//CreateDt: time.Now(),
-		CreateEs:  createEs,
-		Data:      buf.Bytes(),
-		Processed: false,
+		OpinionId:       opinionId,
+		PollId:          pollId,
+		CreateDate:      dateStamp,
+		UserId:          1,
+		CreateEs:        createEs,
+		UpdateEs:        nil,
+		Version:         1,
+		Data:            compressedOpinion.Bytes(),
+		InsertProcessed: false,
 	}
 
-	insert := insertOpinion.BindStruct(opinion)
-
-	if err := insert.Exec(); err != nil {
-		log.Print("AddOpinion: Insert error")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	if !insert(insertOpinion, opinion, ctx) {
 		return
 	}
-
 	encodeIdAndCreateEs(opinionId, createEs, ctx)
 }
 
+func UpdateOpinion(ctx *fasthttp.RequestCtx) {
+	ctx.SetUserValue("recordType", "opinionUpdate")
+
+	pollId, ok := parseIntParam("pollId", ctx)
+	if !ok {
+		return
+	}
+	opinionId, ok := parseIntParam("opinionId", ctx)
+	if !ok {
+		return
+	}
+	createEs, ok := parseIntParam("createEs", ctx)
+	if !ok {
+		return
+	}
+
+}
+
 func AddPoll(ctx *fasthttp.RequestCtx) {
+	ctx.SetUserValue("recordType", "poll")
+
 	requestBytes := (*ctx).Request.Body()
-
 	pollData := PollData{}
-	if err := json.Unmarshal(requestBytes, &pollData); err != nil {
-		log.Print("Unable to unmarshal poll")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	if !unmarshal(requestBytes, &pollData, ctx) {
 		return
 	}
-
-	pollIdCursor, err := sequence.PollId.GetCursor(1)
-	if err != nil {
-		log.Print("AddPoll: Unable to access POLL_ID sequence")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	pollId, ok := getSeq(sequence.PollId, ctx)
+	if !ok {
 		return
 	}
-	pollId := pollIdCursor.Next()
-
-	now := time.Now()
-	createEs := now.Unix()
 
 	pollData.Id = pollId
+	createEs := time.Now().Unix()
 	pollData.CreateEs = createEs
 
-	pollBytes, err := json.Marshal(pollData)
-	if err != nil {
-		log.Print("Unable to marshal poll")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	pollBytes, ok := marshal(pollData, ctx)
+	if !ok {
 		return
 	}
-
-	var buf bytes.Buffer
-	// https://blog.klauspost.com/gzip-performance-for-go-webservers/
-	gz := gzippers.Get().(*gzip.Writer)
-	gz.Reset(&buf)
-
-	defer gzippers.Put(gz)
-
-	if _, err := gz.Write(pollBytes); err != nil {
-		log.Print("Unable to gzip poll")
-		log.Print(err)
-		gz.Close()
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	compressedPoll, ok := zip(pollBytes, ctx)
+	if !ok {
 		return
 	}
-	gz.Close()
 
 	batchId = (batchId + 1) % 128
 
@@ -226,10 +200,9 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		UserId:     1,
 		Date:       dateStamp,
 		CreateEs:   createEs,
-		Data:       buf.Bytes(),
+		Data:       compressedPoll.Bytes(),
 		BatchId:    batchId,
 	}
-
 	thread := Thread{
 		PollId:   pollId,
 		UserId:   1,
@@ -237,23 +210,240 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		Data:     nil,
 	}
 
-	insert := insertPoll.BindStruct(poll)
-	if err := insert.Exec(); err != nil {
-		log.Print("AddPoll: Insert POLLS error")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	if !insert(insertPoll, poll, ctx) {
 		return
 	}
-
-	insert = insertThread.BindStruct(thread)
-	if err := insert.Exec(); err != nil {
-		log.Print("AddPoll: Insert THREADS error")
-		log.Print(err)
-		ctx.Error("Error adding Record", http.StatusInternalServerError)
+	if !insert(insertThread, thread, ctx) {
 		return
 	}
-
 	encodeIdAndCreateEs(pollId, createEs, ctx)
+}
+
+func main() {
+	setupDb()
+	sequence.SetupSequences(DB)
+	defer DB.Close()
+
+	flag.Parse()
+	cron.New(
+		cron.WithLocation(time.UTC)).AddFunc("0 0 * * *", daily)
+	// connect to the ScyllaDB cluster
+	cluster = gocql.NewCluster(strings.SplitN(*scdbHosts, ",", -1)...)
+
+	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	//cluster.Compressor = &gocql.SnappyCompressor{}
+	cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{NumRetries: 3}
+	cluster.Consistency = gocql.Any
+
+	cluster.Keyspace = "votecube"
+
+	session, err = cluster.CreateSession()
+
+	if err != nil {
+		// unable to connect
+		panic(err)
+	}
+	defer session.Close()
+
+	stmt, names := qb.Insert("opinions").Columns(
+		"opinion_id",
+		"poll_id",
+		"create_date",
+		"user_id",
+		"create_es",
+		"update_es",
+		"version",
+		"data",
+		"insert_processed",
+	).ToCql()
+	insertOpinion = gocqlx.Query(session.Query(stmt), names)
+
+	stmt, names = qb.Update("opinions").Set(
+		"update_es",
+		"version",
+		"data",
+	).Where(qb.Eq("poll_id")).ToCql()
+	insertOpinion = gocqlx.Query(session.Query(stmt), names)
+
+	stmt, names = qb.Insert("opinion_updates").Columns(
+		"opinion_id",
+		"poll_id",
+		"update_date",
+		"user_id",
+		"update_es",
+		"data",
+		"update_processed",
+	).ToCql()
+	insertOpinionUpdate = gocqlx.Query(session.Query(stmt), names)
+
+	stmt, names = qb.Insert("polls").Columns(
+		"poll_id",
+		"theme_id",
+		"location_id",
+		"user_id",
+		"date",
+		"create_es",
+		"data",
+		"batch_id",
+	).ToCql()
+	insertPoll = gocqlx.Query(session.Query(stmt), names)
+
+	stmt, names = qb.Insert("threads").Columns(
+		"poll_id",
+		"user_id",
+		"create_es",
+		"data",
+	).ToCql()
+	insertThread = gocqlx.Query(session.Query(stmt), names)
+
+	r := router.New()
+	r.PUT("/put/opinion/:pollId", AddOpinion)
+	r.PUT("/update/opinion/:pollId/:createEs/:opinionId", UpdateOpinion)
+	r.PUT("/put/poll", AddPoll)
+
+	log.Fatal(fasthttp.ListenAndServe(*addr, r.Handler))
+}
+
+func getDateStamp() string {
+	return time.Now().Format("20060102")
+}
+
+func daily() {
+	dateStamp = getDateStamp()
+}
+
+func setupDb() {
+	DB, err = sql.Open("postgres", "postgresql://"+*crdbPath+"/votecube?sslmode=disable")
+
+	if err != nil {
+		panic(err)
+	}
+
+	err = DB.Ping()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func parseIntParam(
+	paramName string,
+	ctx *fasthttp.RequestCtx,
+) (uint64, bool) {
+	number, parseError := strconv.ParseUint(ctx.UserValue(paramName).(string), 0, 64)
+	if parseError != nil {
+		log.Printf("Processing %s - Invalid %s: %s", ctx.UserValue("recordType"), paramName, ctx.UserValue(paramName))
+		log.Print(parseError)
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+
+		return 0, false
+	}
+
+	return number, true
+}
+
+func unmarshal(
+	data []byte,
+	v interface{},
+	ctx *fasthttp.RequestCtx,
+) bool {
+	if err := json.Unmarshal(data, v); err != nil {
+		log.Printf("Unable to unmarshal %s", ctx.UserValue("recordType"))
+		log.Print(err)
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+
+		return false
+	}
+
+	return true
+}
+
+func marshal(
+	v interface{},
+	ctx *fasthttp.RequestCtx,
+) ([]byte, bool) {
+	dataBytes, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("Unable to marshal %s", ctx.UserValue("recordType"))
+		log.Print(err)
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+
+		return nil, false
+	}
+
+	return dataBytes, true
+}
+
+func getSeq(
+	sequence sequence.Sequence,
+	ctx *fasthttp.RequestCtx,
+) (uint64, bool) {
+	idCursor, err := sequence.GetCursor(1)
+	if err != nil {
+		log.Printf("AddOpinion: Unable to access %s sequence", sequence.Name)
+		log.Print(err)
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+
+		return 0, false
+	}
+
+	return idCursor.Next(), true
+}
+
+func zip(
+	dataBytes []byte,
+	ctx *fasthttp.RequestCtx,
+) (bytes.Buffer, bool) {
+	var buf bytes.Buffer
+	// https://blog.klauspost.com/gzip-performance-for-go-webservers/
+	gz := gzippers.Get().(*gzip.Writer)
+	gz.Reset(&buf)
+
+	defer gzippers.Put(gz)
+
+	if _, err := gz.Write(dataBytes); err != nil {
+		log.Print("Unable to gzip %s", ctx.UserValue("recordType"))
+		log.Print(err)
+		gz.Close()
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+		return buf, false
+	}
+	gz.Close()
+
+	return buf, true
+}
+
+func insert(
+	preparedInsert *gocqlx.Queryx,
+	v interface{},
+	ctx *fasthttp.RequestCtx,
+) bool {
+	return exec("INSERT", preparedInsert, v, ctx)
+}
+
+func update(
+	preparedInsert *gocqlx.Queryx,
+	v interface{},
+	ctx *fasthttp.RequestCtx,
+) bool {
+	return exec("UPDATE", preparedInsert, v, ctx)
+}
+
+func exec(
+	operationType string,
+	preparedInsert *gocqlx.Queryx,
+	v interface{},
+	ctx *fasthttp.RequestCtx,
+) bool {
+	statement := preparedInsert.BindStruct(v)
+
+	if err := statement.Exec(); err != nil {
+		log.Printf("Error during %s of %s", operationType, ctx.UserValue("recordType"))
+		log.Print(err)
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+		return false
+	}
+
+	return true
 }
 
 func encodeIdAndCreateEs(id uint64, createEs int64, ctx *fasthttp.RequestCtx) {
@@ -336,67 +526,4 @@ func encodeIdAndCreateEs(id uint64, createEs int64, ctx *fasthttp.RequestCtx) {
 	ctx.Response.AppendBody([]byte{byteMask})
 	ctx.Response.AppendBody(idSignificantBytes)
 	ctx.Response.AppendBody(createEsSignificantBytes)
-}
-
-func GetDateStamp() string {
-	return time.Now().Format("20060102")
-}
-
-func Daily() {
-	dateStamp = GetDateStamp()
-}
-
-func setupDb() {
-	DB, err = sql.Open("postgres", "postgresql://"+*crdbPath+"/votecube?sslmode=disable")
-
-	if err != nil {
-		panic(err)
-	}
-
-	err = DB.Ping()
-	if err != nil {
-		panic(err)
-	}
-}
-
-func main() {
-	setupDb()
-	sequence.SetupSequences(DB)
-	defer DB.Close()
-
-	flag.Parse()
-	cron.New(
-		cron.WithLocation(time.UTC)).AddFunc("0 0 * * *", Daily)
-	// connect to the ScyllaDB cluster
-	cluster = gocql.NewCluster(strings.SplitN(*scdbHosts, ",", -1)...)
-
-	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
-	//cluster.Compressor = &gocql.SnappyCompressor{}
-	cluster.RetryPolicy = &gocql.ExponentialBackoffRetryPolicy{NumRetries: 3}
-	cluster.Consistency = gocql.Any
-
-	cluster.Keyspace = "votecube"
-
-	session, err = cluster.CreateSession()
-
-	if err != nil {
-		// unable to connect
-		panic(err)
-	}
-	defer session.Close()
-
-	stmt, names := qb.Insert("opinions").Columns("opinion_id", "poll_id", "date", "user_id", "create_es", "data").ToCql()
-	insertOpinion = gocqlx.Query(session.Query(stmt), names)
-
-	stmt, names = qb.Insert("polls").Columns("poll_id", "theme_id", "location_id", "user_id", "date", "create_es", "data", "batch_id").ToCql()
-	insertPoll = gocqlx.Query(session.Query(stmt), names)
-
-	stmt, names = qb.Insert("threads").Columns("poll_id", "user_id", "create_es", "data").ToCql()
-	insertThread = gocqlx.Query(session.Query(stmt), names)
-
-	r := router.New()
-	r.PUT("/put/opinion/:pollId", AddOpinion)
-	r.PUT("/put/poll", AddPoll)
-
-	log.Fatal(fasthttp.ListenAndServe(*addr, r.Handler))
 }
