@@ -30,7 +30,7 @@ var (
 	cluster                   *gocql.ClusterConfig
 	session                   *gocql.Session
 	err                       error
-	partitionPeriod           = utils.GetDateHour()
+	partitionPeriod           = utils.GetCurrentDateMinute()
 	insertOpinion             *gocqlx.Queryx
 	insertPoll                *gocqlx.Queryx
 	insertThread              *gocqlx.Queryx
@@ -117,7 +117,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 
 			selectParentPositionQuery := selectParentOpinionData.BindMap(qb.M{
 				"poll_id":       opinionData.PollId,
-				"create_period": utils.GetDateHourFromEpochSeconds(parentCreateEs),
+				"create_period": utils.GetDateMinuteFromEpochSeconds(parentCreateEs),
 				"create_es":     parentCreateEs,
 				"opinion_id":    opinionData.ParentId,
 			})
@@ -211,7 +211,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		version            uint16
 	)
 
-	createPeriod := utils.GetDateHourFromEpochSeconds(opinionData.CreateEs)
+	createPeriod := utils.GetDateMinuteFromEpochSeconds(opinionData.CreateEs)
 
 	selectParentPositionQuery := selectPreviousOpinionData.BindMap(qb.M{
 		"poll_id":       opinionData.PollId,
@@ -284,7 +284,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	updatePeriod := utils.GetDateHourFromEpochSeconds(updateEs)
+	updatePeriod := utils.GetDateMinuteFromEpochSeconds(updateEs)
 	if updatePeriod == createPeriod {
 		updateData = nil
 		updateProcessed = true
@@ -368,7 +368,7 @@ func main() {
 
 	flag.Parse()
 	cron.New(
-		cron.WithLocation(time.UTC)).AddFunc("0 * * * *", hourly)
+		cron.WithLocation(time.UTC)).AddFunc("0,15,30,45 * * * *", every15Minutes)
 	// connect to the ScyllaDB cluster
 	cluster = gocql.NewCluster(strings.SplitN(*scdbHosts, ",", -1)...)
 
@@ -490,6 +490,6 @@ func main() {
 	log.Fatal(fasthttp.ListenAndServe(*addr, r.Handler))
 }
 
-func hourly() {
-	partitionPeriod = utils.GetDateHour()
+func every15Minutes() {
+	partitionPeriod = utils.GetCurrentDateMinute()
 }
