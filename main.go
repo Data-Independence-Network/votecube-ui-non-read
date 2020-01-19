@@ -30,7 +30,7 @@ var (
 	cluster                   *gocql.ClusterConfig
 	session                   *gocql.Session
 	err                       error
-	dateHour                  = utils.GetDateHour()
+	partitionPeriod           = utils.GetDateHour()
 	insertOpinion             *gocqlx.Queryx
 	insertPoll                *gocqlx.Queryx
 	insertThread              *gocqlx.Queryx
@@ -116,10 +116,10 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 			defer wg.Done()
 
 			selectParentPositionQuery := selectParentOpinionData.BindMap(qb.M{
-				"poll_id":     opinionData.PollId,
-				"create_hour": utils.GetDateHourFromEpochSeconds(parentCreateEs),
-				"create_es":   parentCreateEs,
-				"opinion_id":  opinionData.ParentId,
+				"poll_id":       opinionData.PollId,
+				"create_period": utils.GetDateHourFromEpochSeconds(parentCreateEs),
+				"create_es":     parentCreateEs,
+				"opinion_id":    opinionData.ParentId,
 			})
 
 			okParentPosition =
@@ -176,7 +176,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		RootOpinionId:   rootOpinionId,
 		PollId:          opinionData.PollId,
 		Position:        position,
-		CreateHour:      dateHour,
+		CreatePeriod:    partitionPeriod,
 		UserId:          1,
 		CreateEs:        createEs,
 		UpdateEs:        0,
@@ -211,13 +211,13 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		version            uint16
 	)
 
-	createHour := utils.GetDateHourFromEpochSeconds(opinionData.CreateEs)
+	createPeriod := utils.GetDateHourFromEpochSeconds(opinionData.CreateEs)
 
 	selectParentPositionQuery := selectPreviousOpinionData.BindMap(qb.M{
-		"poll_id":     opinionData.PollId,
-		"create_hour": createHour,
-		"create_es":   opinionData.CreateEs,
-		"opinion_id":  opinionData.Id,
+		"poll_id":       opinionData.PollId,
+		"create_period": createPeriod,
+		"create_es":     opinionData.CreateEs,
+		"opinion_id":    opinionData.Id,
 	})
 
 	okPreviousPosition = utils.Select(selectParentPositionQuery, &previousOpinions, ctx)
@@ -274,18 +274,18 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 	}
 
 	updateOpinionQuery := updateOpinion.BindMap(qb.M{
-		"poll_id":     opinionData.PollId,
-		"create_hour": createHour,
-		"create_es":   opinionData.CreateEs,
-		"opinion_id":  opinionData.Id,
+		"poll_id":       opinionData.PollId,
+		"create_period": createPeriod,
+		"create_es":     opinionData.CreateEs,
+		"opinion_id":    opinionData.Id,
 	})
 
 	if !utils.Update(updateOpinionQuery, opinionSetClause, ctx) {
 		return
 	}
 
-	updateHour := utils.GetDateHourFromEpochSeconds(updateEs)
-	if updateHour == createHour {
+	updatePeriod := utils.GetDateHourFromEpochSeconds(updateEs)
+	if updatePeriod == createPeriod {
 		updateData = nil
 		updateProcessed = true
 	} else {
@@ -297,7 +297,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		OpinionId:       opinionData.Id,
 		PollId:          opinionData.PollId,
 		UserId:          1,
-		UpdateHour:      updateHour,
+		UpdatePeriod:    updatePeriod,
 		UpdateEs:        updateEs,
 		Data:            updateData,
 		Version:         version,
@@ -336,14 +336,14 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	batchId = (batchId + 1) % 128
 
 	poll := scylladb.Poll{
-		PollId:     pollId,
-		ThemeId:    1,
-		LocationId: 1,
-		UserId:     1,
-		CreateHour: dateHour,
-		CreateEs:   createEs,
-		Data:       compressedPoll.Bytes(),
-		BatchId:    batchId,
+		PollId:       pollId,
+		ThemeId:      1,
+		LocationId:   1,
+		UserId:       1,
+		CreatePeriod: partitionPeriod,
+		CreateEs:     createEs,
+		Data:         compressedPoll.Bytes(),
+		BatchId:      batchId,
 	}
 	thread := scylladb.Thread{
 		PollId:   pollId,
@@ -390,7 +390,7 @@ func main() {
 	stmt, names := qb.Insert("opinions").Columns(
 		"opinion_id",
 		"poll_id",
-		"create_hour",
+		"create_period",
 		"user_id",
 		"create_es",
 		"update_es",
@@ -406,7 +406,7 @@ func main() {
 		"data",
 	).Where(
 		qb.Eq("poll_id"),
-		qb.Eq("create_hour"),
+		qb.Eq("create_period"),
 		qb.Eq("create_es"),
 		qb.Eq("opinion_id"),
 	).ToCql()
@@ -415,7 +415,7 @@ func main() {
 	stmt, names = qb.Insert("opinion_updates").Columns(
 		"opinion_id",
 		"poll_id",
-		"update_hour",
+		"update_period",
 		"user_id",
 		"update_es",
 		"data",
@@ -457,7 +457,7 @@ func main() {
 		"root_opinion_id",
 	).Where(
 		qb.Eq("poll_id"),
-		qb.Eq("create_hour"),
+		qb.Eq("create_period"),
 		qb.Eq("create_es"),
 		qb.Eq("opinion_id"),
 	).BypassCache().ToCql()
@@ -469,7 +469,7 @@ func main() {
 		"parent_id",
 	).Where(
 		qb.Eq("poll_id"),
-		qb.Eq("create_hour"),
+		qb.Eq("create_period"),
 		qb.Eq("create_es"),
 		qb.Eq("opinion_id"),
 	).BypassCache().ToCql()
@@ -491,5 +491,5 @@ func main() {
 }
 
 func hourly() {
-	dateHour = utils.GetDateHour()
+	partitionPeriod = utils.GetDateHour()
 }

@@ -4,6 +4,7 @@ go 1.13
 
 require (
 	bitbucket.org/votecube/votecube-go-lib v0.0.0
+	github.com/klauspost/compress v1.9.7 // indirect
 	github.com/lib/pq v1.3.0
 	github.com/robfig/cron v0.0.0-00010101000000-000000000000 // indirect
 	github.com/scylladb/gocqlx v1.3.3 // indirect
