@@ -8,7 +8,6 @@ import (
 	"flag"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,50 +22,48 @@ import (
 )
 
 var (
-	DB                        *sql.DB
-	scdbHosts                 = flag.String("scdbHosts", "localhost", "TCP address to listen to")
-	crdbPath                  = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
-	addr                      = flag.String("addr", ":8445", "TCP address to listen to")
-	cluster                   *gocql.ClusterConfig
-	session                   *gocql.Session
-	err                       error
-	partitionPeriod           = utils.GetCurrentDateMinute()
-	insertOpinion             *gocqlx.Queryx
-	insertPoll                *gocqlx.Queryx
-	insertThread              *gocqlx.Queryx
-	insertOpinionUpdate       *gocqlx.Queryx
-	selectNumChildOpinions    *gocqlx.Queryx
-	selectPollId              *gocqlx.Queryx
-	selectParentOpinionData   *gocqlx.Queryx
-	selectPreviousOpinionData *gocqlx.Queryx
-	updateOpinion             *gocqlx.Queryx
-	batchId                   = -1
+	DB                         *sql.DB
+	scdbHosts                  = flag.String("scdbHosts", "localhost", "TCP address to listen to")
+	crdbPath                   = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
+	addr                       = flag.String("addr", ":8445", "TCP address to listen to")
+	cluster                    *gocql.ClusterConfig
+	session                    *gocql.Session
+	err                        error
+	partitionPeriod            = utils.GetCurrentDateMinute()
+	insertOpinion              *gocqlx.Queryx
+	insertPoll                 *gocqlx.Queryx
+	insertOpinionUpdate        *gocqlx.Queryx
+	selectPollId               *gocqlx.Queryx
+	selectPollAndRootOpinionId *gocqlx.Queryx
+	selectParentOpinionData    *gocqlx.Queryx
+	selectPreviousOpinionData  *gocqlx.Queryx
+	updateOpinion              *gocqlx.Queryx
+	opinionInsertBatchId       int32 = 0
+	opinionUpdateBatchId       int32 = 0
+	pollInsertBatchId          int32 = 0
 	//compress = flag.Bool("compress", false, "Whether to enable transparent response compression")
 )
 
 type OpinionData struct {
-	Id       uint64 `json:"id"`
-	PollId   uint64 `json:"pollId"`
-	ParentId uint64 `json:parentId,omitempty`
-	CreateEs int64  `json:"createEs"`
-	UpdateEs int64  `json:"createEs,omitempty"`
-	Text     string `json:"text"`
+	CreateEs        int64  `json:"createEs"`
+	Id              int64  `json:"id"`
+	ParentOpinionId int64  `json:parentId,omitempty`
+	PollId          int64  `json:"pollId"`
+	Text            string `json:"text"`
+	UserId          int64  `json:"userId"`
 }
 
 type PollData struct {
-	Id       uint64 `json:"id"`
-	CreateEs int64  `json:"createEs"`
-	Title    string `json:"title"`
 	Contents string `json:"contents"` // `json:"contents,omitempty"`
+	CreateEs int64  `json:"createEs"`
+	Id       int64  `json:"id"`
+	Title    string `json:"title"`
+	UserId   int64  `json:"userId"`
 }
 
 func AddOpinion(ctx *fasthttp.RequestCtx) {
 	ctx.SetUserValue("recordType", "opinion")
 
-	parentCreateEs, ok := utils.ParseInt64Param("parentCreateEs", ctx)
-	if !ok {
-		return
-	}
 	requestBytes := (*ctx).Request.Body()
 	opinionData := OpinionData{}
 	if !utils.Unmarshal(requestBytes, &opinionData, ctx) {
@@ -74,86 +71,63 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	}
 
 	var (
-		numChildOpinions    int
-		okNumChildPositions bool
-		okParentPosition    = true
-		okPollExists        bool
-		parentOpinions      []scylladb.Opinion
-		pollExistsRows      []scylladb.Poll
-		position            string
-		rootOpinionId       uint64
-		version             uint16
-		wg                  sync.WaitGroup
+		okPollOrParentOpinionExists bool
+		parentOpinionRows           []scylladb.Opinion
+		parentPollRows              []scylladb.Poll
+		rootOpinionId               int64
+		version                     int16
+		waitGroup                   sync.WaitGroup
 	)
-	selectPollIdQuery := selectPollId.BindMap(qb.M{
-		"poll_id": opinionData.PollId,
-	})
-	selectNumChildOpinionsQuery := selectNumChildOpinions.BindMap(qb.M{
-		"poll_id":   opinionData.PollId,
-		"parent_id": opinionData.ParentId,
-	})
-
-	numQueries := 2
-	if opinionData.ParentId != 0 {
-		numQueries = 3
+	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, waitGroup)
+	if userContext == nil {
+		return
 	}
 
-	wg.Add(numQueries)
+	// If there is a parent opinion query for it
+	// Otherwise query the poll to ensure it exists
+
+	waitGroup.Add(2)
 	// TODO: test all (2 or more) queries are failing at the same time
+	go utils.GetUserSession(*userContext)
 	go func() {
-		defer wg.Done()
-		okPollExists =
-			utils.Select(selectPollIdQuery, &pollExistsRows, ctx)
-	}()
-	go func() {
-		defer wg.Done()
-		okNumChildPositions =
-			utils.SelectCount(selectNumChildOpinionsQuery, &numChildOpinions, ctx)
-	}()
+		defer waitGroup.Done()
 
-	if opinionData.ParentId != 0 {
-		go func() {
-			defer wg.Done()
-
-			selectParentPositionQuery := selectParentOpinionData.BindMap(qb.M{
-				"poll_id":       opinionData.PollId,
-				"create_period": utils.GetDateMinuteFromEpochSeconds(parentCreateEs),
-				"create_es":     parentCreateEs,
-				"opinion_id":    opinionData.ParentId,
+		if opinionData.ParentOpinionId == 0 {
+			selectPollIdQuery := selectPollId.BindMap(qb.M{
+				"poll_id": opinionData.PollId,
 			})
+			okPollOrParentOpinionExists =
+				utils.Select(selectPollIdQuery, &parentPollRows, ctx)
+		} else {
+			selectParentOpinionDataQuery := selectParentOpinionData.BindMap(qb.M{
+				"opinion_id": opinionData.ParentOpinionId,
+			})
+			okPollOrParentOpinionExists =
+				utils.Select(selectParentOpinionDataQuery, &parentOpinionRows, ctx)
+		}
+	}()
+	waitGroup.Wait()
 
-			okParentPosition =
-				utils.Select(selectParentPositionQuery, &parentOpinions, ctx)
-		}()
-	}
-	wg.Wait()
-
-	if !okPollExists || !okNumChildPositions || !okParentPosition {
+	if !okPollOrParentOpinionExists || !utils.CheckSession(*userContext) {
 		return
 	}
-
-	if len(pollExistsRows) != 1 {
-		log.Printf("Did not find a poll record with poll_id: %d", opinionData.PollId)
-		ctx.Error("Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	position = strconv.Itoa(numChildOpinions)
 
 	rootOpinionId = 0
-	if opinionData.ParentId != 0 {
-		if len(parentOpinions) != 1 {
-			log.Printf("Did not find parent opinion record for poll_id: %d, create_es: %d, opinion_id: %d", opinionData.PollId, parentCreateEs, opinionData.ParentId)
+	if opinionData.ParentOpinionId == 0 {
+		if len(parentPollRows) != 1 {
+			log.Printf("Did not find poll for poll_id: %d", opinionData.PollId)
 			ctx.Error("Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		parentOpinion := parentOpinions[0]
-		position = parentOpinion.Position + "." + position
-		if parentOpinion.RootOpinionId == 0 {
-			rootOpinionId = opinionData.ParentId
-		} else {
-			rootOpinionId = parentOpinion.RootOpinionId
+	} else {
+		if len(parentOpinionRows) != 1 {
+			log.Printf("Did not find parent opinion opinion_id: %d", opinionData.ParentOpinionId)
+			ctx.Error("Internal Server Error", http.StatusInternalServerError)
+			return
 		}
+		parentOpinion := parentOpinionRows[0]
+		opinionData.PollId = parentOpinion.PollId
+		rootOpinionId = parentOpinion.RootOpinionId
 	}
 
 	opinionId, ok := utils.GetSeq(sequence.OpinionId, ctx)
@@ -162,7 +136,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	}
 
 	opinionData.Id = opinionId
-	createEs := time.Now().Unix()
+	createEs := utils.GetCurrentEs()
 	opinionData.CreateEs = createEs
 
 	compressedOpinion, ok := utils.MarshalZip(opinionData, ctx)
@@ -172,23 +146,28 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 
 	version = 1
 	opinion := scylladb.Opinion{
-		OpinionId:       opinionId,
-		RootOpinionId:   rootOpinionId,
 		PollId:          opinionData.PollId,
-		Position:        position,
-		CreatePeriod:    partitionPeriod,
-		UserId:          1,
-		CreateEs:        createEs,
-		UpdateEs:        0,
+		PartitionPeriod: partitionPeriod,
+		AgeSuitability:  0,
+		OpinionId:       opinionId,
+		ThemeId:         0,
+		LocationId:      0,
+		IngestBatchId:   opinionInsertBatchId,
 		Version:         version,
+		RootOpinionId:   rootOpinionId,
+		ParentOpinionId: opinionData.ParentOpinionId,
+		CreateEs:        createEs,
+		UserId:          userContext.UserId,
 		Data:            compressedOpinion.Bytes(),
 		InsertProcessed: false,
 	}
 
+	opinionInsertBatchId = (opinionInsertBatchId + 1) % 16
+
 	if !utils.Insert(insertOpinion, opinion, ctx) {
 		return
 	}
-	utils.ReturnIdAndCreateEsAndVersion(opinionId, createEs, version, ctx)
+	utils.ReturnId(opinionId, ctx)
 }
 
 func UpdateOpinion(ctx *fasthttp.RequestCtx) {
@@ -206,109 +185,108 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		okPreviousPosition bool
 		previousOpinions   []scylladb.Opinion
 		previousOpinion    scylladb.Opinion
-		updateData         []byte
-		updateProcessed    bool
-		version            uint16
+		version            int16
+		waitGroup          sync.WaitGroup
 	)
+	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, waitGroup)
+	if userContext == nil {
+		return
+	}
 
-	createPeriod := utils.GetDateMinuteFromEpochSeconds(opinionData.CreateEs)
+	waitGroup.Add(2)
+	go utils.GetUserSession(*userContext)
+	go func() {
+		defer waitGroup.Done()
 
-	selectParentPositionQuery := selectPreviousOpinionData.BindMap(qb.M{
-		"poll_id":       opinionData.PollId,
-		"create_period": createPeriod,
-		"create_es":     opinionData.CreateEs,
-		"opinion_id":    opinionData.Id,
-	})
+		selectParentPositionQuery := selectPreviousOpinionData.BindMap(qb.M{
+			"opinion_id": opinionData.Id,
+		})
 
-	okPreviousPosition = utils.Select(selectParentPositionQuery, &previousOpinions, ctx)
-	if !okPreviousPosition {
+		okPreviousPosition = utils.Select(selectParentPositionQuery, &previousOpinions, ctx)
+	}()
+	waitGroup.Wait()
+
+	if !okPreviousPosition || !utils.CheckSession(*userContext) {
 		return
 	}
 
 	if len(previousOpinions) != 1 {
-		log.Printf("Did not find a poll record with poll_id: %d", opinionData.PollId)
+		log.Printf("Did not find an opinion record with opinion_id: %d", opinionData.Id)
 		ctx.Error("Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	previousOpinion = previousOpinions[0]
 
-	// TODO: verify that the opinion belongs to the specified user
+	// TODO: Move this check to Auth rules a la Firebase rules
+	if previousOpinion.UserId != (*userContext).UserId {
+		log.Printf("Opinion user_id: %d does not match provided user_id: %d",
+			previousOpinion.UserId, (*userContext).UserId)
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// TODO: this can also be done with Firebase style rules
+	opinionData.PollId = previousOpinion.PollId
+	opinionData.ParentOpinionId = previousOpinion.ParentOpinionId
+	opinionData.CreateEs = previousOpinion.CreateEs
 
 	/**
-	Version never should but technically can overflow (to 0).  This is OK since version
+	Version never should but technically can overflow (to negative).  This is OK since version
 	isn't part of the ID is needed only for caching Opinion responses in CDN and browser.
-	Since the cache only lasts a day and it never SHOULD overflow (especially in one day)
-	it is OK.
 	*/
-	version = previousOpinion.Version + 1 // no need to % 65536, this runs OK on overflow
-	// since previousOpinion.Version is uint16
+	version = previousOpinion.Version + 1 // no need to % math.Exp2(15), this runs OK on
+	// overflow since previousOpinion.Version is int16 (it now goes to -2^15)
 	/*
-		Tested on https://play.golang.org/ with:
+			Tested on https://play.golang.org/ with:
 		func main() {
-			var (
-				val uint16
-				val2 uint16
-			)
-			val = 65535
-			val2 = val + 1
-			fmt.Printf("Overflow Assign %d\n", val2) // Overflow Assign 0
+			var test int16 = int16(math.Exp2(15) - 1)
+			fmt.Printf("Before overflow: %d\n", test)
+			test = test + 1
+			fmt.Printf("After overflow:  %d\n", test)
 		}
 	*/
-
-	updateEs := time.Now().Unix()
-
-	opinionData.ParentId = previousOpinion.ParentId // Should not be in input
-	opinionData.UpdateEs = updateEs
 
 	compressedOpinion, ok := utils.MarshalZip(opinionData, ctx)
 	if !ok {
 		return
 	}
 
-	version = 1
 	opinionSetClause := scylladb.Opinion{
-		UpdateEs: updateEs,
-		Version:  version,
-		Data:     compressedOpinion.Bytes(),
+		Version: version,
+		Data:    compressedOpinion.Bytes(),
 	}
-
 	updateOpinionQuery := updateOpinion.BindMap(qb.M{
-		"poll_id":       opinionData.PollId,
-		"create_period": createPeriod,
-		"create_es":     opinionData.CreateEs,
-		"opinion_id":    opinionData.Id,
+		"opinion_id": opinionData.Id,
 	})
-
 	if !utils.Update(updateOpinionQuery, opinionSetClause, ctx) {
 		return
 	}
 
-	updatePeriod := utils.GetDateMinuteFromEpochSeconds(updateEs)
-	if updatePeriod == createPeriod {
-		updateData = nil
-		updateProcessed = true
-	} else {
-		updateData = compressedOpinion.Bytes()
-		updateProcessed = false
+	updatePeriod := utils.GetDateMinuteFromEpochSeconds(opinionData.CreateEs)
+	if updatePeriod == partitionPeriod {
+		// No, need to create an update record, the original record hasn't yet
+		// been picked up by the batch process
+		utils.ReturnShortVersion(version, ctx)
+		return
 	}
 
+	opinionUpdateBatchId = (opinionUpdateBatchId + 1) % 16
+
 	opinionUpdate := scylladb.OpinionUpdate{
-		OpinionId:       opinionData.Id,
 		PollId:          opinionData.PollId,
-		UserId:          1,
-		UpdatePeriod:    updatePeriod,
-		UpdateEs:        updateEs,
-		Data:            updateData,
+		PartitionPeriod: partitionPeriod,
+		IngestBatchId:   opinionUpdateBatchId,
+		OpinionId:       opinionData.Id,
 		Version:         version,
-		UpdateProcessed: updateProcessed,
+		UpdateProcessed: false,
 	}
 
 	if !utils.Insert(insertOpinionUpdate, opinionUpdate, ctx) {
 		return
 	}
 
-	utils.ReturnIdAndCreateEsAndVersion(opinionData.Id, opinionData.CreateEs, version, ctx)
+	utils.ReturnShortVersion(version, ctx)
 }
 
 func AddPoll(ctx *fasthttp.RequestCtx) {
@@ -319,13 +297,17 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	if !utils.Unmarshal(requestBytes, &pollData, ctx) {
 		return
 	}
+	if !utils.IsValidSession(ctx, pollData.UserId) {
+		return
+	}
+
 	pollId, ok := utils.GetSeq(sequence.PollId, ctx)
 	if !ok {
 		return
 	}
 
 	pollData.Id = pollId
-	createEs := time.Now().Unix()
+	createEs := utils.GetCurrentEs()
 	pollData.CreateEs = createEs
 
 	compressedPoll, ok := utils.MarshalZip(pollData, ctx)
@@ -333,32 +315,25 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	batchId = (batchId + 1) % 128
-
 	poll := scylladb.Poll{
-		PollId:       pollId,
-		ThemeId:      1,
-		LocationId:   1,
-		UserId:       1,
-		CreatePeriod: partitionPeriod,
-		CreateEs:     createEs,
-		Data:         compressedPoll.Bytes(),
-		BatchId:      batchId,
+		PollId:          pollId,
+		ThemeId:         1,
+		LocationId:      1,
+		IngestBatchId:   pollInsertBatchId,
+		UserId:          pollData.UserId,
+		CreateEs:        createEs,
+		PartitionPeriod: partitionPeriod,
+		AgeSuitability:  0,
+		Data:            compressedPoll.Bytes(),
+		InsertProcessed: false,
 	}
-	thread := scylladb.Thread{
-		PollId:   pollId,
-		UserId:   1,
-		CreateEs: createEs,
-		Data:     nil,
-	}
+
+	pollInsertBatchId = (pollInsertBatchId + 1) % 16
 
 	if !utils.Insert(insertPoll, poll, ctx) {
 		return
 	}
-	if !utils.Insert(insertThread, thread, ctx) {
-		return
-	}
-	utils.ReturnIdAndCreateEs(pollId, createEs, ctx)
+	utils.ReturnId(pollId, ctx)
 }
 
 func main() {
@@ -367,8 +342,12 @@ func main() {
 	defer DB.Close()
 
 	flag.Parse()
-	cron.New(
-		cron.WithLocation(time.UTC)).AddFunc("0,15,30,45 * * * *", every15Minutes)
+	c := cron.New(cron.WithLocation(time.UTC))
+	//c.AddFunc("0,15,30,45 * * * *", everyPartitionPeriod)
+	//c.AddFunc("0,10,20,30,40,50 * * * *", everyPartitionPeriod)
+	c.AddFunc("0,5,10,15,20,25,30,35,40,45,50,55 * * * *", everyPartitionPeriod)
+	c.Start()
+
 	// connect to the ScyllaDB cluster
 	cluster = gocql.NewCluster(strings.SplitN(*scdbHosts, ",", -1)...)
 
@@ -386,6 +365,8 @@ func main() {
 		panic(err)
 	}
 	defer session.Close()
+
+	utils.SetupAuthQueries(session)
 
 	stmt, names := qb.Insert("opinions").Columns(
 		"opinion_id",
@@ -436,29 +417,9 @@ func main() {
 	).ToCql()
 	insertPoll = gocqlx.Query(session.Query(stmt), names)
 
-	stmt, names = qb.Insert("threads").Columns(
-		"poll_id",
-		"user_id",
-		"create_es",
-		"data",
-	).ToCql()
-	insertThread = gocqlx.Query(session.Query(stmt), names)
-
-	stmt, names = qb.Select("opinion_child_count_base").Count(
-		"parent_id",
-	).Where(
-		qb.Eq("poll_id"),
-		qb.Eq("parent_id"),
-	).BypassCache().ToCql()
-	selectNumChildOpinions = gocqlx.Query(session.Query(stmt), names)
-
 	stmt, names = qb.Select("opinions").Columns(
-		"position",
 		"root_opinion_id",
 	).Where(
-		qb.Eq("poll_id"),
-		qb.Eq("create_period"),
-		qb.Eq("create_es"),
 		qb.Eq("opinion_id"),
 	).BypassCache().ToCql()
 	selectParentOpinionData = gocqlx.Query(session.Query(stmt), names)
@@ -467,6 +428,8 @@ func main() {
 		"user_id",
 		"version",
 		"parent_id",
+		"poll_id",
+		"create_es",
 	).Where(
 		qb.Eq("poll_id"),
 		qb.Eq("create_period"),
@@ -475,21 +438,35 @@ func main() {
 	).BypassCache().ToCql()
 	selectPreviousOpinionData = gocqlx.Query(session.Query(stmt), names)
 
-	stmt, names = qb.Select("poll_keys").Columns(
+	stmt, names = qb.Select("polls").Columns(
 		"poll_id",
 	).Where(
 		qb.Eq("poll_id"),
 	).BypassCache().ToCql()
 	selectPollId = gocqlx.Query(session.Query(stmt), names)
 
+	stmt, names = qb.Select("opinions").Columns(
+		"poll_id",
+		"root_opinion_id",
+	).Where(
+		qb.Eq("poll_id"),
+	).BypassCache().ToCql()
+	selectPollAndRootOpinionId = gocqlx.Query(session.Query(stmt), names)
+
 	r := router.New()
-	r.PUT("/put/opinion/:pollId/:parentCreateEs", AddOpinion)
-	r.PUT("/update/opinion/:pollId/:createEs/:opinionId", UpdateOpinion)
-	r.PUT("/put/poll", AddPoll)
+	r.PUT("/put/opinion/:sessionPartitionPeriod/:sessionId", AddOpinion)
+	r.PUT("/update/opinion/:sessionPartitionPeriod/:sessionId", UpdateOpinion)
+	r.PUT("/put/poll/:sessionPartitionPeriod/:sessionId", AddPoll)
 
 	log.Fatal(fasthttp.ListenAndServe(*addr, r.Handler))
 }
 
-func every15Minutes() {
+func everyPartitionPeriod() {
 	partitionPeriod = utils.GetCurrentDateMinute()
 }
+
+/**
+wg                  sync.WaitGroup
+
+	wg.Add(numQueries)
+*/
