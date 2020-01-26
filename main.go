@@ -22,32 +22,35 @@ import (
 )
 
 var (
-	DB                         *sql.DB
-	scdbHosts                  = flag.String("scdbHosts", "localhost", "TCP address to listen to")
-	crdbPath                   = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
-	addr                       = flag.String("addr", ":8445", "TCP address to listen to")
-	cluster                    *gocql.ClusterConfig
-	session                    *gocql.Session
-	err                        error
-	partitionPeriod            = utils.GetCurrentDateMinute()
-	insertOpinion              *gocqlx.Queryx
-	insertPoll                 *gocqlx.Queryx
-	insertOpinionUpdate        *gocqlx.Queryx
-	selectPollId               *gocqlx.Queryx
-	selectPollAndRootOpinionId *gocqlx.Queryx
-	selectParentOpinionData    *gocqlx.Queryx
-	selectPreviousOpinionData  *gocqlx.Queryx
-	updateOpinion              *gocqlx.Queryx
-	opinionInsertBatchId       int32 = 0
-	opinionUpdateBatchId       int32 = 0
-	pollInsertBatchId          int32 = 0
+	DB                                *sql.DB
+	scdbHosts                         = flag.String("scdbHosts", "localhost", "TCP address to listen to")
+	crdbPath                          = flag.String("crdbPath", "root@localhost:26257", "TCP address to listen to")
+	addr                              = flag.String("addr", ":8445", "TCP address to listen to")
+	cluster                           *gocql.ClusterConfig
+	session                           *gocql.Session
+	err                               error
+	partitionPeriod                   = utils.GetCurrentParitionPeriod(5)
+	insertOpinion                     *gocqlx.Queryx
+	insertPoll                        *gocqlx.Queryx
+	insertOpinionUpdate               *gocqlx.Queryx
+	selectPollId                      *gocqlx.Queryx
+	selectPollAndRootOpinionId        *gocqlx.Queryx
+	selectParentOpinionData           *gocqlx.Queryx
+	selectPreviousOpinionData         *gocqlx.Queryx
+	updateOpinion                     *gocqlx.Queryx
+	updatePeriodAddedToRootOpinionIds *gocqlx.Queryx
+	updatePeriodUpdatedRootOpinionIds *gocqlx.Queryx
+	opinionUpdateBatchId              int32 = 0
+	pollInsertBatchId                 int32 = 0
+	opinionMod                        int64 = 2
 	//compress = flag.Bool("compress", false, "Whether to enable transparent response compression")
 )
 
 type OpinionData struct {
 	CreateEs        int64  `json:"createEs"`
 	Id              int64  `json:"id"`
-	ParentOpinionId int64  `json:parentId,omitempty`
+	RootOpinionId   int64  `json:rootOpinionId,omitempty`
+	ParentOpinionId int64  `json:parentOpinionId,omitempty`
 	PollId          int64  `json:"pollId"`
 	Text            string `json:"text"`
 	UserId          int64  `json:"userId"`
@@ -130,6 +133,17 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		rootOpinionId = parentOpinion.RootOpinionId
 	}
 
+	periodAddedToRootIdSetClause := scylladb.PeriodAddedToRootOpinionIds{
+		RootOpinionIdMod: int16(rootOpinionId % opinionMod),
+	}
+	updatePeriodAddedToRootOpinionIdsQuery := updatePeriodAddedToRootOpinionIds.BindMap(qb.M{
+		"partition_period":    nil,
+		"root_opinion_id_mod": nil,
+	})
+	if !utils.Update(updatePeriodAddedToRootOpinionIdsQuery, periodAddedToRootIdSetClause, ctx) {
+		return
+	}
+
 	opinionId, ok := utils.GetSeq(sequence.OpinionId, ctx)
 	if !ok {
 		return
@@ -152,7 +166,6 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		OpinionId:       opinionId,
 		ThemeId:         0,
 		LocationId:      0,
-		IngestBatchId:   opinionInsertBatchId,
 		Version:         version,
 		RootOpinionId:   rootOpinionId,
 		ParentOpinionId: opinionData.ParentOpinionId,
@@ -161,8 +174,6 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		Data:            compressedOpinion.Bytes(),
 		InsertProcessed: false,
 	}
-
-	opinionInsertBatchId = (opinionInsertBatchId + 1) % 16
 
 	if !utils.Insert(insertOpinion, opinion, ctx) {
 		return
@@ -226,6 +237,19 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	opinionData.RootOpinionId = previousOpinion.RootOpinionId
+
+	periodUpdatedRootIdSetClause := scylladb.PeriodUpdatedRootOpinionIds{
+		RootOpinionIdMod: int16(opinionData.RootOpinionId % opinionMod),
+	}
+	updatePeriodUpdatedRootOpinionIdsQuery := updatePeriodAddedToRootOpinionIds.BindMap(qb.M{
+		"partition_period":    nil,
+		"root_opinion_id_mod": nil,
+	})
+	if !utils.Update(updatePeriodUpdatedRootOpinionIdsQuery, periodUpdatedRootIdSetClause, ctx) {
+		return
+	}
+
 	// TODO: this can also be done with Firebase style rules
 	opinionData.PollId = previousOpinion.PollId
 	opinionData.ParentOpinionId = previousOpinion.ParentOpinionId
@@ -274,9 +298,8 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 	opinionUpdateBatchId = (opinionUpdateBatchId + 1) % 16
 
 	opinionUpdate := scylladb.OpinionUpdate{
-		PollId:          opinionData.PollId,
 		PartitionPeriod: partitionPeriod,
-		IngestBatchId:   opinionUpdateBatchId,
+		RootOpinionId:   opinionData.RootOpinionId,
 		OpinionId:       opinionData.Id,
 		Version:         version,
 		UpdateProcessed: false,
@@ -393,6 +416,22 @@ func main() {
 	).ToCql()
 	updateOpinion = gocqlx.Query(session.Query(stmt), names)
 
+	stmt, names = qb.Update("period_added_to_root_opinion_ids").Set(
+		"root_opinion_id",
+	).Where(
+		qb.Eq("partition_period"),
+		qb.Eq("root_opinion_id_mod"),
+	).ToCql()
+	updatePeriodAddedToRootOpinionIds = gocqlx.Query(session.Query(stmt), names)
+
+	stmt, names = qb.Update("period_updated_root_opinion_ids").Set(
+		"root_opinion_id",
+	).Where(
+		qb.Eq("partition_period"),
+		qb.Eq("root_opinion_id_mod"),
+	).ToCql()
+	updatePeriodUpdatedRootOpinionIds = gocqlx.Query(session.Query(stmt), names)
+
 	stmt, names = qb.Insert("opinion_updates").Columns(
 		"opinion_id",
 		"poll_id",
@@ -425,11 +464,12 @@ func main() {
 	selectParentOpinionData = gocqlx.Query(session.Query(stmt), names)
 
 	stmt, names = qb.Select("opinions").Columns(
+		"create_es",
+		"parent_opinion_id",
+		"poll_id",
+		"root_opinion_id",
 		"user_id",
 		"version",
-		"parent_id",
-		"poll_id",
-		"create_es",
 	).Where(
 		qb.Eq("poll_id"),
 		qb.Eq("create_period"),
@@ -462,7 +502,7 @@ func main() {
 }
 
 func everyPartitionPeriod() {
-	partitionPeriod = utils.GetCurrentDateMinute()
+	partitionPeriod = utils.GetCurrentParitionPeriod(5)
 }
 
 /**
