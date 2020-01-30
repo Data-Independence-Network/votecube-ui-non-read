@@ -30,10 +30,11 @@ var (
 	cluster                           *gocql.ClusterConfig
 	session                           *gocql.Session
 	err                               error
-	partitionPeriod                   = utils.GetCurrentParitionPeriod(5)
+	partitionPeriod                   = utils.GetCurrentPartitionPeriod(5)
 	insertOpinion                     *gocqlx.Queryx
-	insertPoll                        *gocqlx.Queryx
 	insertOpinionUpdate               *gocqlx.Queryx
+	insertPoll                        *gocqlx.Queryx
+	insertRootOpinion                 *gocqlx.Queryx
 	selectPollId                      *gocqlx.Queryx
 	selectParentOpinionData           *gocqlx.Queryx
 	selectPreviousOpinionData         *gocqlx.Queryx
@@ -72,7 +73,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 
 	waitGroup.Add(2)
 	// TODO: test all (2 or more) queries are failing at the same time
-	go utils.GetUserSession(*userContext)
+	go utils.GetUserSession(userContext)
 	go func() {
 		defer waitGroup.Done()
 
@@ -92,7 +93,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	}()
 	waitGroup.Wait()
 
-	if !okPollOrParentOpinionExists || !utils.CheckSession(*userContext) {
+	if !okPollOrParentOpinionExists || !utils.CheckSession(userContext) {
 		return
 	}
 
@@ -112,23 +113,23 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		parentOpinion := parentOpinionRows[0]
 		opinionData.PollId = parentOpinion.PollId
 		rootOpinionId = parentOpinion.RootOpinionId
+
+		rootOpinionIdMod := int32(rootOpinionId % rootOpinionIdModFactor)
+
+		periodAddedToRootIdSetClause := scylladb.PeriodAddedToRootOpinionIds{
+			RootOpinionIdMod: rootOpinionIdMod,
+		}
+		updatePeriodAddedToRootOpinionIdsQuery := updatePeriodAddedToRootOpinionIds.BindMap(qb.M{
+			"partition_period":    partitionPeriod,
+			"root_opinion_id_mod": rootOpinionIdMod,
+		})
+		if !utils.Update(
+			updatePeriodAddedToRootOpinionIdsQuery, periodAddedToRootIdSetClause, ctx) {
+			return
+		}
 	}
 
-	rootOpinionIdMod := int32(rootOpinionId % rootOpinionIdModFactor)
-
-	periodAddedToRootIdSetClause := scylladb.PeriodAddedToRootOpinionIds{
-		RootOpinionIdMod: rootOpinionIdMod,
-	}
-	updatePeriodAddedToRootOpinionIdsQuery := updatePeriodAddedToRootOpinionIds.BindMap(qb.M{
-		"partition_period":    partitionPeriod,
-		"root_opinion_id_mod": rootOpinionIdMod,
-	})
-	if !utils.Update(
-		updatePeriodAddedToRootOpinionIdsQuery, periodAddedToRootIdSetClause, ctx) {
-		return
-	}
-
-	opinionId, ok := utils.GetSeq(sequence.OpinionId, ctx)
+	opinionId, ok := utils.GetSeq(&sequence.OpinionId, ctx)
 	if !ok {
 		return
 	}
@@ -142,16 +143,20 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	if opinionData.ParentOpinionId == 0 {
+		rootOpinionId = opinionId
+	}
+
 	version = 1
 	opinion := scylladb.Opinion{
-		PollId:          opinionData.PollId,
 		PartitionPeriod: partitionPeriod,
-		AgeSuitability:  0,
+		RootOpinionId:   rootOpinionId,
 		OpinionId:       opinionId,
+		AgeSuitability:  0,
+		PollId:          opinionData.PollId,
 		ThemeId:         0,
 		LocationId:      0,
 		Version:         version,
-		RootOpinionId:   rootOpinionId,
 		ParentOpinionId: opinionData.ParentOpinionId,
 		CreateEs:        createEs,
 		UserId:          userContext.UserId,
@@ -162,6 +167,29 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 	if !utils.Insert(insertOpinion, opinion, ctx) {
 		return
 	}
+
+	if opinionData.ParentOpinionId == 0 {
+		// Add a new root_opinion
+
+		opinionDataList := [1]data.Opinion{opinionData}
+
+		compressedRootOpinionData, ok := utils.MarshalZip(opinionDataList, ctx)
+		if !ok {
+			return
+		}
+
+		rootOpinion := scylladb.RootOpinion{}
+		rootOpinion.OpinionId = rootOpinionId
+		rootOpinion.PollId = opinionData.PollId
+		rootOpinion.Version = partitionPeriod
+		rootOpinion.CreateEs = createEs
+		rootOpinion.Data = compressedRootOpinionData.Bytes()
+
+		if !utils.Insert(insertRootOpinion, rootOpinion, ctx) {
+			return
+		}
+	}
+
 	utils.ReturnId(opinionId, ctx)
 }
 
@@ -189,7 +217,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 	}
 
 	waitGroup.Add(2)
-	go utils.GetUserSession(*userContext)
+	go utils.GetUserSession(userContext)
 	go func() {
 		defer waitGroup.Done()
 
@@ -201,7 +229,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 	}()
 	waitGroup.Wait()
 
-	if !okPreviousPosition || !utils.CheckSession(*userContext) {
+	if !okPreviousPosition || !utils.CheckSession(userContext) {
 		return
 	}
 
@@ -307,7 +335,7 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	pollId, ok := utils.GetSeq(sequence.PollId, ctx)
+	pollId, ok := utils.GetSeq(&sequence.PollId, ctx)
 	if !ok {
 		return
 	}
@@ -328,8 +356,8 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 		ThemeId:         1,
 		LocationId:      1,
 		PollIdMod:       pollIdMod,
-		UserId:          pollData.UserId,
 		CreateEs:        createEs,
+		UserId:          pollData.UserId,
 		PartitionPeriod: partitionPeriod,
 		AgeSuitability:  0,
 		Data:            compressedPoll.Bytes(),
@@ -372,28 +400,31 @@ func main() {
 	}
 	defer session.Close()
 
+	session.SetConsistency(gocql.LocalQuorum)
+
 	utils.SetupAuthQueries(session)
 
 	stmt, names := qb.Insert("opinions").Columns(
+		"partition_period",
+		"root_opinion_id",
 		"opinion_id",
+		"age_suitability",
 		"poll_id",
-		"create_period",
-		"user_id",
-		"create_es",
-		"update_es",
+		"theme_id",
+		"location_id",
 		"version",
+		"parent_opinion_id",
+		"create_es",
+		"user_id",
 		"data",
 		"insert_processed",
 	).ToCql()
 	insertOpinion = gocqlx.Query(session.Query(stmt), names)
 
 	stmt, names = qb.Insert("opinion_updates").Columns(
+		"partition_period",
+		"root_opinion_id",
 		"opinion_id",
-		"poll_id",
-		"update_period",
-		"user_id",
-		"update_es",
-		"data",
 		"version",
 		"update_processed",
 	).ToCql()
@@ -403,13 +434,24 @@ func main() {
 		"poll_id",
 		"theme_id",
 		"location_id",
-		"user_id",
-		"date",
 		"create_es",
+		"poll_id_mod",
+		"user_id",
+		"partition_period",
+		"age_suitability",
 		"data",
-		"ingest_batch_id",
+		"insert_processed",
 	).ToCql()
 	insertPoll = gocqlx.Query(session.Query(stmt), names)
+
+	stmt, names = qb.Insert("opinions").Columns(
+		"opinion_id",
+		"poll_id",
+		"version",
+		"data",
+		"create_es",
+	).ToCql()
+	insertRootOpinion = gocqlx.Query(session.Query(stmt), names)
 
 	stmt, names = qb.Select("opinions").Columns(
 		"root_opinion_id",
@@ -470,14 +512,14 @@ func main() {
 
 	r := router.New()
 	r.PUT("/put/opinion/:sessionPartitionPeriod/:sessionId", AddOpinion)
-	r.PUT("/update/opinion/:sessionPartitionPeriod/:sessionId", UpdateOpinion)
 	r.PUT("/put/poll/:sessionPartitionPeriod/:sessionId", AddPoll)
+	r.PUT("/update/opinion/:sessionPartitionPeriod/:sessionId", UpdateOpinion)
 
 	log.Fatal(fasthttp.ListenAndServe(*addr, r.Handler))
 }
 
 func everyPartitionPeriod() {
-	partitionPeriod = utils.GetCurrentParitionPeriod(5)
+	partitionPeriod = utils.GetCurrentPartitionPeriod(5)
 }
 
 /**
