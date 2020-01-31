@@ -63,7 +63,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		version                     int16
 		waitGroup                   sync.WaitGroup
 	)
-	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, waitGroup)
+	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, &waitGroup)
 	if userContext == nil {
 		return
 	}
@@ -211,7 +211,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		version            int16
 		waitGroup          sync.WaitGroup
 	)
-	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, waitGroup)
+	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, &waitGroup)
 	if userContext == nil {
 		return
 	}
@@ -344,7 +344,7 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	createEs := utils.GetCurrentEs()
 	pollData.CreateEs = createEs
 
-	compressedPoll, ok := utils.MarshalZip(pollData, ctx)
+	compressedPoll, ok := utils.MarshalZip(&pollData, ctx)
 	if !ok {
 		return
 	}
@@ -444,7 +444,7 @@ func main() {
 	).ToCql()
 	insertPoll = gocqlx.Query(session.Query(stmt), names)
 
-	stmt, names = qb.Insert("opinions").Columns(
+	stmt, names = qb.Insert("root_opinions").Columns(
 		"opinion_id",
 		"poll_id",
 		"version",
