@@ -5,6 +5,7 @@ import (
 	"bitbucket.org/votecube/votecube-go-lib/model/scylladb"
 	"bitbucket.org/votecube/votecube-go-lib/sequence"
 	"bitbucket.org/votecube/votecube-go-lib/utils"
+	vespa2 "bitbucket.org/votecube/votecube-go-lib/utils/vespa"
 	"database/sql"
 	"flag"
 	"log"
@@ -190,6 +191,10 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
+	if !vespa2.AddOpinion("http://localhost:8086", opinionData, ctx) {
+		return
+	}
+
 	utils.ReturnId(opinionId, ctx)
 }
 
@@ -320,6 +325,10 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	if !vespa2.UpdateOpinion("http://localhost:8086", opinionData, ctx) {
+		return
+	}
+
 	utils.ReturnShortVersion(version, ctx)
 }
 
@@ -367,6 +376,11 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	if !utils.Insert(insertPoll, poll, ctx) {
 		return
 	}
+
+	if !vespa2.AddPoll("http://localhost:8086", pollData, ctx) {
+		return
+	}
+
 	utils.ReturnId(pollId, ctx)
 }
 
