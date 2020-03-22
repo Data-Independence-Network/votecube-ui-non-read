@@ -10,6 +10,7 @@ require (
 	github.com/robfig/cron v0.0.0-00010101000000-000000000000
 	github.com/scylladb/gocqlx v1.3.3
 	github.com/valyala/fasthttp v1.9.0
+	github.com/volatiletech/sqlboiler v3.6.1+incompatible
 )
 
 replace github.com/gocql/gocql => github.com/scylladb/gocql v1.3.1

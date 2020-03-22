@@ -3,11 +3,15 @@ package main
 import (
 	"bitbucket.org/votecube/votecube-go-lib/model/data"
 	"bitbucket.org/votecube/votecube-go-lib/model/scylladb"
+	"bitbucket.org/votecube/votecube-go-lib/model/vespa"
 	"bitbucket.org/votecube/votecube-go-lib/sequence"
 	"bitbucket.org/votecube/votecube-go-lib/utils"
+	"bitbucket.org/votecube/votecube-go-lib/utils/crdb"
 	vespa2 "bitbucket.org/votecube/votecube-go-lib/utils/vespa"
+	"bitbucket.org/votecube/votecube-ui-non-read/model"
 	"database/sql"
 	"flag"
+	"github.com/volatiletech/sqlboiler/boil"
 	"log"
 	"net/http"
 	"strings"
@@ -47,6 +51,128 @@ var (
 	//compress = flag.Bool("compress", false, "Whether to enable transparent response compression")
 )
 
+func AddFeedback(ctx *fasthttp.RequestCtx) {
+	ctx.SetUserValue("recordType", "feedback")
+
+	requestBytes := (*ctx).Request.Body()
+	feedbackData := data.Feedback{}
+	if !utils.Unmarshal(requestBytes, &feedbackData, ctx) {
+		return
+	}
+
+	if feedbackData.AgeSuitability < 0 || feedbackData.AgeSuitability > 10 {
+		log.Print("Invalid feedbackTypeId")
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	if feedbackData.FeedbackTypeId < 0 || feedbackData.FeedbackTypeId > 10 {
+		log.Print("Invalid feedbackTypeId")
+		ctx.Error("Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	if feedbackData.UserAccountId != 0 && !utils.IsValidSession(ctx, feedbackData.UserAccountId) {
+		return
+	}
+
+	feedbackId, ok := utils.GetSeq(&sequence.FeedbackId, ctx)
+	if !ok {
+		return
+	}
+
+	createTime, _, createDtb := utils.GetCurrentDtb()
+
+	feedbackData.Id = feedbackId
+	feedbackData.CreateDtb = createDtb
+
+	if !vespa2.AddFeedback("http://localhost:8086", feedbackData, ctx) {
+		return
+	}
+
+	if !crdb.AddFeedback(feedbackData, createTime, ctx) {
+		return
+	}
+
+	utils.ReturnId(feedbackId, ctx)
+}
+
+func AddFeedbackComment(ctx *fasthttp.RequestCtx) {
+	ctx.SetUserValue("recordType", "opinion")
+
+	requestBytes := (*ctx).Request.Body()
+	feedbackComment := data.FeedbackComment{}
+	if !utils.Unmarshal(requestBytes, &feedbackComment, ctx) {
+		return
+	}
+
+	var (
+		okParentFeedbackExists bool
+		feedbackVespa          *vespa.Feedback
+		ok                     bool
+		waitGroup              sync.WaitGroup
+	)
+	userContext := utils.NewParallelUserContext(ctx, feedbackComment.UserAccountId, &waitGroup)
+	if userContext == nil {
+		return
+	}
+
+	// If there is a parent opinion query for it
+	// Otherwise query the poll to ensure it exists
+
+	waitGroup.Add(2)
+	// TODO: test all (2 or more) queries are failing at the same time
+	go utils.GetUserSession(userContext)
+	go func() {
+		defer waitGroup.Done()
+
+		feedbackVespa, ok := vespa2.GetFeedbackById("http://localhost:8086", feedbackComment.FeedbackId, ctx)
+
+		if !ok {
+			return
+		}
+
+		okParentFeedbackExists = feedbackVespa != nil
+	}()
+	waitGroup.Wait()
+
+	if !okParentFeedbackExists || !utils.CheckSession(userContext) {
+		return
+	}
+
+	feedbackCommentId, ok := utils.GetSeq(&sequence.FeedbackCommentId, ctx)
+	if !ok {
+		return
+	}
+
+	createTime, _, createDtb := utils.GetCurrentDtb()
+	feedbackComment.CreateDtb = createDtb
+	feedbackComment.FeedbackTypeId = feedbackVespa.FeedbackTypeId
+	feedbackComment.Id = feedbackCommentId
+
+	if !vespa2.AddFeedbackComment("http://localhost:8086", feedbackComment, ctx) {
+		return
+	}
+
+	if !crdb.AddFeedbackComment(feedbackComment, createTime, ctx) {
+		return
+	}
+
+	utils.ReturnId(feedbackCommentId, ctx)
+}
+
+func GetLatestFeedbackForType(
+	ctx *fasthttp.RequestCtx,
+) {
+
+}
+
+func GetLatestFeedbackCommentsForFeedbackId(
+	ctx *fasthttp.RequestCtx,
+) {
+
+}
+
 func AddOpinion(ctx *fasthttp.RequestCtx) {
 	ctx.SetUserValue("recordType", "opinion")
 
@@ -64,7 +190,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		version                     int16
 		waitGroup                   sync.WaitGroup
 	)
-	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, &waitGroup)
+	userContext := utils.NewParallelUserContext(ctx, opinionData.UserAccountId, &waitGroup)
 	if userContext == nil {
 		return
 	}
@@ -111,7 +237,12 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 			ctx.Error("Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		parentOpinion := parentOpinionRows[0]
+
+		parentOpinion := data.Opinion{}
+		if !utils.UnzipUnmarshal(parentOpinionRows[0].Data, parentOpinion, ctx) {
+			return
+		}
+
 		opinionData.PollId = parentOpinion.PollId
 		rootOpinionId = parentOpinion.RootOpinionId
 
@@ -135,32 +266,36 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	opinionData.Id = opinionId
-	createEs := utils.GetCurrentEs()
-	opinionData.CreateEs = createEs
-
-	compressedOpinion, ok := utils.MarshalZip(opinionData, ctx)
-	if !ok {
-		return
-	}
+	_, _, createDtb := utils.GetCurrentDtb()
 
 	if opinionData.ParentOpinionId == 0 {
 		rootOpinionId = opinionId
 	}
 
 	version = 1
+	opinionData.CreateDtb = createDtb
+	opinionData.Id = opinionId
+	opinionData.RootOpinionId = rootOpinionId
+	opinionData.UserAccountId = userContext.UserAccountId
+	opinionData.Version = version
+
+	compressedOpinion, ok := utils.MarshalZip(opinionData, ctx)
+	if !ok {
+		return
+	}
+
 	opinion := scylladb.Opinion{
 		PartitionPeriod: partitionPeriod,
 		RootOpinionId:   rootOpinionId,
 		OpinionId:       opinionId,
-		AgeSuitability:  0,
-		PollId:          opinionData.PollId,
-		ThemeId:         0,
-		LocationId:      0,
-		Version:         version,
-		ParentOpinionId: opinionData.ParentOpinionId,
-		CreateEs:        createEs,
-		UserId:          userContext.UserId,
+		//AgeSuitability:  opinionData.AgeSuitability,
+		//CreateEs:        createDtb,
+		//ParentOpinionId: opinionData.ParentOpinionId,
+		//PollId:          opinionData.PollId,
+		//ThemeId:         opinionData.ThemeId,
+		//LocationId:      opinionData.LocationId,
+		Version: version,
+		//UserAccountId:          userContext.UserAccountId,
 		Data:            compressedOpinion.Bytes(),
 		InsertProcessed: false,
 	}
@@ -183,7 +318,7 @@ func AddOpinion(ctx *fasthttp.RequestCtx) {
 		rootOpinion.OpinionId = rootOpinionId
 		rootOpinion.PollId = opinionData.PollId
 		rootOpinion.Version = partitionPeriod
-		rootOpinion.CreateEs = createEs
+		rootOpinion.CreateEs = createDtb
 		rootOpinion.Data = compressedRootOpinionData.Bytes()
 
 		if !utils.Insert(insertRootOpinion, rootOpinion, ctx) {
@@ -210,13 +345,13 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 	// TODO: verify structure of the data
 
 	var (
-		okPreviousPosition bool
-		previousOpinions   []scylladb.Opinion
-		previousOpinion    scylladb.Opinion
-		version            int16
-		waitGroup          sync.WaitGroup
+		okPreviousPosition  bool
+		previousOpinionRows []scylladb.Opinion
+		previousOpinion     data.Opinion = data.Opinion{}
+		version             int16
+		waitGroup           sync.WaitGroup
 	)
-	userContext := utils.NewParallelUserContext(ctx, opinionData.UserId, &waitGroup)
+	userContext := utils.NewParallelUserContext(ctx, opinionData.UserAccountId, &waitGroup)
 	if userContext == nil {
 		return
 	}
@@ -230,7 +365,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 			"opinion_id": opinionData.Id,
 		})
 
-		okPreviousPosition = utils.Select(selectParentPositionQuery, &previousOpinions, ctx)
+		okPreviousPosition = utils.Select(selectParentPositionQuery, &previousOpinionRows, ctx)
 	}()
 	waitGroup.Wait()
 
@@ -238,18 +373,20 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if len(previousOpinions) != 1 {
+	if len(previousOpinionRows) != 1 {
 		log.Printf("Did not find an opinion record with opinion_id: %d\n", opinionData.Id)
 		ctx.Error("Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	previousOpinion = previousOpinions[0]
+	if !utils.UnzipUnmarshal(previousOpinionRows[0].Data, previousOpinion, ctx) {
+		return
+	}
 
 	// TODO: Move this check to Auth rules a la Firebase rules
-	if previousOpinion.UserId != (*userContext).UserId {
+	if previousOpinion.UserAccountId != (*userContext).UserAccountId {
 		log.Printf("Opinion user_id: %d does not match provided user_id: %d\n",
-			previousOpinion.UserId, (*userContext).UserId)
+			previousOpinion.UserAccountId, (*userContext).UserAccountId)
 		ctx.Error("Internal Server Error", http.StatusInternalServerError)
 		return
 	}
@@ -258,7 +395,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 	opinionData.RootOpinionId = previousOpinion.RootOpinionId
 	opinionData.PollId = previousOpinion.PollId
 	opinionData.ParentOpinionId = previousOpinion.ParentOpinionId
-	opinionData.CreateEs = previousOpinion.CreateEs
+	opinionData.CreateDtb = previousOpinion.CreateDtb
 
 	/**
 	Version never should but technically can overflow (to negative).  This is OK since version
@@ -292,7 +429,7 @@ func UpdateOpinion(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	updatePeriod := utils.GetDateMinuteFromEpochSeconds(opinionData.CreateEs)
+	updatePeriod := utils.GetDateMinuteFromEpochSeconds(opinionData.CreateDtb)
 	if updatePeriod == partitionPeriod {
 		// No, need to create an update record, the original record hasn't yet
 		// been picked up by the batch process
@@ -336,11 +473,11 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	ctx.SetUserValue("recordType", "poll")
 
 	requestBytes := (*ctx).Request.Body()
-	pollData := data.Poll{}
+	pollData := model.Poll{}
 	if !utils.Unmarshal(requestBytes, &pollData, ctx) {
 		return
 	}
-	if !utils.IsValidSession(ctx, pollData.UserId) {
+	if !utils.IsValidSession(ctx, pollData.UserAccount.Id) {
 		return
 	}
 
@@ -350,8 +487,14 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	}
 
 	pollData.Id = pollId
-	createEs := utils.GetCurrentEs()
-	pollData.CreateEs = createEs
+	//_, _, createDtb := utils.GetCurrentDtb()
+
+	//pollData.CreateDtb = createDtb
+	pollData.CreatedAt = time.Now().Unix()
+
+	//now := time.Now()
+	//secs := now.Unix()
+	//fmt.Println(time.Unix(secs, 0))
 
 	compressedPoll, ok := utils.MarshalZip(&pollData, ctx)
 	if !ok {
@@ -361,14 +504,14 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 	pollIdMod := int32(pollId % pollIdModFactor)
 
 	poll := scylladb.Poll{
-		PollId:          pollId,
-		ThemeId:         1,
-		LocationId:      1,
-		PollIdMod:       pollIdMod,
-		CreateEs:        createEs,
-		UserId:          pollData.UserId,
+		PollId: pollId,
+		//ThemeId:         1,
+		//LocationId:      1,
+		PollIdMod: pollIdMod,
+		//CreateEs:        createDtb,
+		//UserAccountId:          pollData.UserAccountId,
 		PartitionPeriod: partitionPeriod,
-		AgeSuitability:  0,
+		//AgeSuitability:  0,
 		Data:            compressedPoll.Bytes(),
 		InsertProcessed: false,
 	}
@@ -386,8 +529,11 @@ func AddPoll(ctx *fasthttp.RequestCtx) {
 
 func main() {
 	DB = utils.SetupDb(*crdbPath)
-	sequence.SetupSequences(DB)
 	defer DB.Close()
+
+	sequence.SetupSequences(DB)
+
+	boil.SetDB(DB)
 
 	flag.Parse()
 	c := cron.New(cron.WithLocation(time.UTC))
@@ -422,14 +568,14 @@ func main() {
 		"partition_period",
 		"root_opinion_id",
 		"opinion_id",
-		"age_suitability",
-		"poll_id",
-		"theme_id",
-		"location_id",
+		//"age_suitability",
+		//"poll_id",
+		//"theme_id",
+		//"location_id",
 		"version",
-		"parent_opinion_id",
-		"create_es",
-		"user_id",
+		//"parent_opinion_id",
+		//"create_es",
+		//"user_id",
 		"data",
 		"insert_processed",
 	).ToCql()
@@ -446,13 +592,13 @@ func main() {
 
 	stmt, names = qb.Insert("polls").Columns(
 		"poll_id",
-		"theme_id",
-		"location_id",
-		"create_es",
 		"poll_id_mod",
-		"user_id",
 		"partition_period",
-		"age_suitability",
+		//"theme_id",
+		//"location_id",
+		//"create_es",
+		//"user_id",
+		//"age_suitability",
 		"data",
 		"insert_processed",
 	).ToCql()
@@ -525,8 +671,12 @@ func main() {
 	updatePeriodUpdatedRootOpinionIds = gocqlx.Query(session.Query(stmt), names)
 
 	r := router.New()
-	r.PUT("/put/opinion/:sessionPartitionPeriod/:sessionId", AddOpinion)
-	r.PUT("/put/poll/:sessionPartitionPeriod/:sessionId", AddPoll)
+	r.PUT("/add/feedback/:sessionId", AddFeedback)
+	r.PUT("/add/feedbackComment/:sessionId", AddFeedbackComment)
+	r.PUT("/add/opinion/:sessionPartitionPeriod/:sessionId", AddOpinion)
+	r.PUT("/add/poll/:sessionPartitionPeriod/:sessionId", AddPoll)
+	r.PUT("/get/feedback/latest/:feedbackTypeId", GetLatestFeedbackForType)
+	r.PUT("/get/feedbackComment/latest/:feedbackId", GetLatestFeedbackCommentsForFeedbackId)
 	r.PUT("/update/opinion/:sessionPartitionPeriod/:sessionId", UpdateOpinion)
 
 	log.Fatal(fasthttp.ListenAndServe(*addr, r.Handler))
